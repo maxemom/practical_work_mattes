@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Env / caches
+.env
+.cache/
+.venv/
+
+# Conda
+.conda/
+
+# VS-Codium / VSCode
+.vscode/
+
+# OS
+.DS_Store
+
+# Outputs
+outputs/*.png
+outputs/*.html
+outputs/*.csv
+outputs/*.json
+outputs/*.parquet

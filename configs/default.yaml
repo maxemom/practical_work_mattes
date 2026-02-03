@@ -1,0 +1,3 @@
+# Placeholder config (you will fill this later)
+run:
+  output_dir: "outputs"

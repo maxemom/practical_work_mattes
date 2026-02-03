@@ -1,0 +1,19 @@
+name: pwm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - pip:
+      - torch
+      - transformers
+      - accelerate
+      - inseq
+      - numpy
+      - pandas
+      - scikit-learn
+      - pyyaml
+      - matplotlib
+      - pytest
+      - pipdeptree
