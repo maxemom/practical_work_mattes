@@ -1,3 +1,0 @@
-pip install "ipython<9"
-pip install inseq
-pip install 

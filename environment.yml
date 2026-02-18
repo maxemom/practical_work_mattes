@@ -4,7 +4,6 @@ channels:
 dependencies:
   - python=3.11
   - pip
-  - git
   - pip:
       - torch
       - transformers
