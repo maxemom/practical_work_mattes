@@ -5,6 +5,7 @@ from inseq.models import attribution_model
 from torch import device
 from torch.cuda import temperature
 from torch.nn import parameter
+import torch
 
 def prepare_inseq(resolved: Dict[str, Any]) -> Any:
     model_name = resolved["model"]["name"]

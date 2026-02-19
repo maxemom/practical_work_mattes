@@ -6,10 +6,10 @@ seeds:
 runtime:
   device: auto
 generation:
-  temperature: 0.7
-  do_sample: true
-  top_p: 20
   max_new_tokens: 10
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
 model:
   name: model_1
   params:

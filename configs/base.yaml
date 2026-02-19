@@ -8,8 +8,11 @@ seeds:
 runtime:
   device: auto
 
+runtime:
+  device: auto
+
 generation:
-  temperature: 0.7
-  do_sample: True 
-  top_p: 20
   max_new_tokens: 10
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0

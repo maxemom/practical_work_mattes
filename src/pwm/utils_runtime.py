@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 
+
+# -------------------------
+# Device resolution
+# -------------------------
 
 @dataclass
 class DeviceReport:
@@ -26,7 +30,7 @@ def _normalize_device(device: str) -> str:
 def _cuda_device_names() -> Tuple[str, ...]:
     if not torch.cuda.is_available():
         return tuple()
-    names = []
+    names: List[str] = []
     for i in range(torch.cuda.device_count()):
         try:
             names.append(torch.cuda.get_device_name(i))
@@ -43,7 +47,6 @@ def resolve_device(requested: str) -> DeviceReport:
     cuda_count = torch.cuda.device_count() if cuda_avail else 0
     cuda_names = _cuda_device_names()
 
-    # Helper: validate an explicit cuda:N
     def cuda_index_ok(dev: str) -> bool:
         if not dev.startswith("cuda:"):
             return False
@@ -64,7 +67,7 @@ def resolve_device(requested: str) -> DeviceReport:
         else:
             chosen = "cpu"
 
-    elif requested_norm in ("cpu",):
+    elif requested_norm == "cpu":
         chosen = "cpu"
 
     elif requested_norm in ("cuda", "cuda:0"):
@@ -89,7 +92,6 @@ def resolve_device(requested: str) -> DeviceReport:
             reason = "MPS requested but not available"
 
     else:
-        # Unknown string -> fallback
         chosen = "cuda:0" if cuda_avail else ("mps" if mps_avail else "cpu")
         reason = f"Unknown device string '{requested_norm}'"
 
@@ -105,29 +107,117 @@ def resolve_device(requested: str) -> DeviceReport:
     )
 
 
-def apply_device_resolution(resolved: Dict[str, Any], verbose: bool = True) -> DeviceReport:
+# -------------------------
+# Generation overrides (model.params -> generation)
+# -------------------------
+
+@dataclass
+class GenerationReport:
+    before: Dict[str, Any]
+    after: Dict[str, Any]
+    overridden: Dict[str, Dict[str, Any]]  # key -> {"from": x, "to": y}
+    source: str  # where overrides came from (e.g. "model.params")
+
+
+# Whitelist: only keys that should be treated as generation settings
+GENERATION_KEYS = {
+    "max_new_tokens",
+    "min_new_tokens",
+    "max_length",
+    "min_length",
+    "temperature",
+    "top_p",
+    "top_k",
+    "do_sample",
+    "num_beams",
+    "repetition_penalty",
+    "length_penalty",
+    "no_repeat_ngram_size",
+    "early_stopping",
+    "eos_token_id",
+    "pad_token_id",
+    "bos_token_id",
+}
+
+
+def apply_generation_overrides(resolved: Dict[str, Any]) -> GenerationReport:
+    """
+    Merges generation defaults with per-model overrides.
+    Convention:
+      - resolved["generation"] contains defaults (base.yaml)
+      - resolved["model"]["params"] can contain generation keys which override defaults
+    Writes back to resolved["generation"] (final values).
+    """
+    resolved.setdefault("generation", {})
+    resolved.setdefault("model", {})
+    model_params = resolved.get("model", {}).get("params", {}) or {}
+
+    before = dict(resolved["generation"])
+    after = dict(resolved["generation"])
+    overridden: Dict[str, Dict[str, Any]] = {}
+
+    for k, v in model_params.items():
+        if k in GENERATION_KEYS:
+            old = after.get(k, None)
+            after[k] = v
+            if old != v:
+                overridden[k] = {"from": old, "to": v}
+
+    resolved["generation"] = after
+
+    return GenerationReport(
+        before=before,
+        after=after,
+        overridden=overridden,
+        source="model.params",
+    )
+
+
+# -------------------------
+# Combined runtime apply + report
+# -------------------------
+
+def apply_runtime_resolution(resolved: Dict[str, Any], verbose: bool = True) -> Tuple[DeviceReport, GenerationReport]:
+    # device
     resolved.setdefault("runtime", {})
     requested = resolved["runtime"].get("device", "auto")
+    device_report = resolve_device(requested)
+    resolved["runtime"]["device"] = device_report.chosen
 
-    report = resolve_device(requested)
-
-    # write back
-    resolved["runtime"]["device"] = report.chosen
+    # generation overrides
+    gen_report = apply_generation_overrides(resolved)
 
     if verbose:
-        print("=== Device Check ===")
-        print(f"Requested: {report.requested}")
-        print(f"Chosen:    {report.chosen}")
-        if report.changed:
-            print(f"Changed:   yes")
-            if report.reason:
-                print(f"Reason:    {report.reason}")
+        print("=== Runtime Check ===")
+
+        # Device part
+        print("[Device]")
+        print(f"  Requested: {device_report.requested}")
+        print(f"  Chosen:    {device_report.chosen}")
+        if device_report.changed:
+            print(f"  Changed:   yes")
+            if device_report.reason:
+                print(f"  Reason:    {device_report.reason}")
         else:
-            print("Changed:   no")
-        print(f"CUDA:      {report.cuda_available} (count={report.cuda_device_count})")
-        if report.cuda_device_names:
-            print(f"CUDA GPUs: {list(report.cuda_device_names)}")
-        print(f"MPS:       {report.mps_available}")
+            print("  Changed:   no")
+        print(f"  CUDA:      {device_report.cuda_available} (count={device_report.cuda_device_count})")
+        if device_report.cuda_device_names:
+            print(f"  CUDA GPUs: {list(device_report.cuda_device_names)}")
+        print(f"  MPS:       {device_report.mps_available}")
+
+        # Generation part
+        print("[Generation]")
+        if gen_report.overridden:
+            print(f"  Overrides from {gen_report.source}:")
+            for k, d in gen_report.overridden.items():
+                print(f"    - {k}: {d['from']} -> {d['to']}")
+        else:
+            print("  No per-model generation overrides applied.")
+
+        print("  Final generation:")
+        for k in sorted(gen_report.after.keys()):
+            print(f"    {k}: {gen_report.after[k]}")
+
         print("====================")
 
-    return report
+    return device_report, gen_report
