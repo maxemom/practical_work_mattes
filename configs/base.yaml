@@ -3,13 +3,13 @@ paths:
   output_dir: outputs
 
 seeds:
-  train_seed: 42
-  eval_seed: 17
+  seed: 42
 
-device: cuda:0
+runtime:
+  device: auto
 
-num_workers: 8
-
-default_parameters:
-  learning_rate: 0.001
-  batch_size: 32 
+generation:
+  temperature: 0.7
+  do_sample: True 
+  top_p: 20
+  max_new_tokens: 10

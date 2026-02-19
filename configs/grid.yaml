@@ -3,55 +3,16 @@ models:
     params:
       temperature: 0.7
       top_p: 0.9
-  - name: model_2
-    params:
-      temperature: 1.0
-  - name: model_3
-    datasets:
-      - name: dataset_1
-        params:
-          split: test
-      - name: dataset_2
-      - name: dataset_3
-attribution_functions:
-  - name: function_1
-    params:
-      steps: 50
-  - name: function_2
-    params:
-      baseline: zero
-  - name: function_3
-dimensionality_reduction_methods:
-  - name: method_1
-    params:
-      n_components: 2
-  - name: method_2
-    params:
-      perplexity: 30
-  - name: method_3
-    params:
-      temperature: 0.7
-      top_p: 0.9
-  - name: model_2
-    params:
-      temperature: 1.0
-  - name: model_3
 
 datasets:
   - name: dataset_1
     params:
       split: test
-  - name: dataset_2
-  - name: dataset_3
 
 attribution_functions:
   - name: function_1
     params:
       steps: 50
-  - name: function_2
-    params:
-      baseline: zero
-  - name: function_3
 
 dimensionality_reduction_methods:
   - name: method_1
@@ -59,5 +20,4 @@ dimensionality_reduction_methods:
       n_components: 2
   - name: method_2
     params:
-      perplexity: 30
-  - name: method_3
+      n_components: 3
