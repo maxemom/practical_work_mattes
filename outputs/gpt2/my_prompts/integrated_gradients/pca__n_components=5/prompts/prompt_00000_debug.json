@@ -1,0 +1,13 @@
+{
+  "idx": 0,
+  "prompt": "Hello, you are",
+  "source_text": "Hello, you are",
+  "full_text": "Hello, you are not allowed to use this site for any purpose other than to post here.\n",
+  "source_len": 4,
+  "full_len": 20,
+  "raw_target_shape": [
+    16,
+    16,
+    768
+  ]
+}

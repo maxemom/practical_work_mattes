@@ -1,7 +1,7 @@
 models:
-  - name: sshleifer/tiny-gpt2
+  - name: gpt2
     params:
-      max_new_tokens: 8
+      max_new_tokens: 16
       do_sample: false
       temperature: 1.0
       top_p: 1.0

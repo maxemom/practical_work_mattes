@@ -8,6 +8,10 @@ seeds:
 runtime:
   device: auto
 
+aggregation:
+  baseline: L2Norm
+  normalize: True
+
 runtime:
   device: auto
 
