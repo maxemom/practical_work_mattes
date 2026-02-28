@@ -1,0 +1,20 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# keep datasets out of the image
+data/raw/
+outputs/
+
+# notebooks / experiments
+notebooks/
+.ipynb_checkpoints/
+
+# model files / caches
+*.pt
+*.bin
+*.safetensors
+.cache/

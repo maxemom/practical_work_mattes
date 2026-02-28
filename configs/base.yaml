@@ -1,5 +1,11 @@
 paths:
-  data_dir: data
+  raw:
+    wikitext2_train: data/raw/wikitext-2/train.txt
+    tellmewhy_csv: data/raw/tellmewhy/train.csv
+
+  processed:
+    wikitext2_100: data/processed/wikitext2_100_seed42.txt
+    tellmewhy_100: data/processed/tellmewhy_100_seed42.txt
   output_dir: outputs
 
 seeds:

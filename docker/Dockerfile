@@ -1,12 +1,9 @@
 FROM mambaorg/micromamba:1.5.8
 
-WORKDIR /workspace
-
-# (Optional) OS-level tools. Git nur, wenn du im Container git brauchst.
+COPY src/ /workspace/src/
+COPY scripts/ /workspace/scripts/
+COPY configs/ /workspace/configs/
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
- && rm -rf /var/lib/apt/lists/*
 USER $MAMBA_USER
 
 # 1) Nur die Environment-Definition kopieren, damit Docker caching sauber funktioniert
@@ -18,7 +15,6 @@ RUN micromamba create -y -f /tmp/environment.yml && \
 
 # 3) Env im Container automatisch aktivieren
 ENV MAMBA_DOCKERFILE_ACTIVATE=1
-ENV CONDA_DEFAULT_ENV=pwm
 
 # 4) Projektcode kopieren (ändert sich häufig -> später in der Layer-Reihenfolge)
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /workspace

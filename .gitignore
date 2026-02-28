@@ -1,26 +1,19 @@
-# Python
+# data & outputs
+data/raw/
+data/downloads/
+data/cache/
+outputs/
+
+# python
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-.pytest_cache/
-
-# Env / caches
-.env
-.cache/
 .venv/
-
-# Conda
-.conda/
-
-# VS-Codium / VSCode
-.vscode/
+.env
 
 # OS
 .DS_Store
 
-# Outputs
-outputs/*.png
-outputs/*.html
-outputs/*.csv
-outputs/*.json
-outputs/*.parquet
+# model artifacts
+*.pt
+*.bin
+*.safetensors
