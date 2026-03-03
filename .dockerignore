@@ -5,8 +5,8 @@ __pycache__/
 *.pyd
 .DS_Store
 
-# keep datasets out of the image
-data/raw/
+# keep datasets out of the image (mount processed data at runtime)
+data/
 outputs/
 
 # notebooks / experiments

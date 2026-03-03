@@ -7,7 +7,6 @@ paths:
     wikitext2_100: data/processed/wikitext2_100_seed42.txt
     tellmewhy_100: data/processed/tellmewhy_100_seed42.txt
   output_dir: outputs
-
 seeds:
   seed: 42
 
@@ -16,13 +15,14 @@ runtime:
 
 aggregation:
   baseline: L2Norm
-  normalize: True
-
-runtime:
-  device: auto
+  normalize: true
 
 generation:
   max_new_tokens: 10
   do_sample: false
   temperature: 1.0
   top_p: 1.0
+
+metrics:
+  metric_stride: 1
+  debug_steps: false

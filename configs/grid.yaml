@@ -1,21 +1,44 @@
 models:
-  - name: gpt2
+  - name: Qwen/Qwen2-1.5B
     params:
-      max_new_tokens: 16
+      max_new_tokens: 10
       do_sample: false
-      temperature: 1.0
-      top_p: 1.0
 
 datasets:
-  - name: my_prompts
-    path: data/prompts.txt
+  - name: TellMeWhy
+    path: data/processed/tellmewhy_5_seed42.txt
+
 
 attribution_functions:
-  - name: integrated_gradients
+  - name: saliency
+    params: {}
+
+  - name: input_x_gradient
+    params: {}
+
+  - name: deeplift
+    params: {}
+
+  - name: gradient_shap
     params:
-      n_steps: 20
+      n_samples: 24
+      stdevs: 0.01
+
+  - name: value_zeroing
+    params: {}
 
 dimensionality_reduction_methods:
   - name: pca
-    params:
-      n_components: 5
+    params: { n_components: 5 }
+
+  - name: factor_analysis
+    params: { n_components: 5 }
+
+  - name: ica
+    params: { n_components: 5 }
+
+  - name: kernel_pca
+    params: { n_components: 5 }
+
+  - name: nmf
+    params: { n_components: 5 }

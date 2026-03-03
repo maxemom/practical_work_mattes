@@ -1,141 +1,71 @@
-# Practical Work – Attribution Functions for LLMs
+# Practical Work: Reproducible Attribution Pipeline
 
-This project evaluates attribution methods for decoder-only language models.  
-The entire experimental pipeline is containerized using Docker to ensure reproducibility.
+This repository runs a reproducible pipeline for decoder-only LLM attribution:
 
-The repository contains small, processed evaluation datasets (100 samples each).  
-Raw datasets are not included for size and licensing reasons.
+- HF generation (`model.generate` with `attention_mask`)
+- inseq attribution on fixed `(prompt, generated_text)`
+- baseline and dimred postprocessing from one raw attribution tensor
+- SoftNorm metrics with A4 batching (`full`, `R`, `notR`, `0` in one forward)
 
----
+## Run with Docker
 
-## Requirements
-
-- Docker
-- Git
-
-No local Python installation is required.
-
----
-
-## 1. Clone Repository
+Build image:
 
 ```bash
-git clone <your-repository-url>
-cd Practical_Work_Mattes
+docker build -t pwm -f docker/Dockerfile .
 ```
 
----
-
-## 2. Build Docker Image
-
-```bash
-docker build -t pwm .
-```
-
-This builds a Docker image containing:
-
-- Python 3.11
-- PyTorch
-- Transformers
-- Inseq
-- All required dependencies
-
-The image contains **code and dependencies only** (no datasets).
-
----
-
-## 3. Dataset Mounting
-
-Processed evaluation datasets are included in the repository under:
-
-```
-data/processed/
-```
-
-Since the Docker image does not include data, the `data/` directory must be mounted into the container.
-
----
-
-## 4. Run Experiments
-
-Create an output directory:
+Run pipeline (mount processed data only):
 
 ```bash
 mkdir -p outputs
+docker run --rm \
+  -v "$PWD/data/processed:/workspace/data/processed:ro" \
+  -v "$PWD/outputs:/workspace/outputs" \
+  pwm python scripts/run_grid.py --base configs/base.yaml --grid configs/grid.yaml --device auto
 ```
 
-Run the experiment pipeline:
+Optional minimal/debug run:
 
 ```bash
 docker run --rm \
-  -v "$PWD/data:/workspace/data" \
+  -v "$PWD/data/processed:/workspace/data/processed:ro" \
   -v "$PWD/outputs:/workspace/outputs" \
-  pwm python scripts/run_grid.py --base configs/base.yaml --grid configs/grid.yaml
+  pwm python scripts/run_grid.py \
+    --base configs/base.yaml \
+    --grid configs/grid.yaml \
+    --device mps \
+    --max-prompts 2 \
+    --only-attr saliency \
+    --only-dimred pca \
+    --only-prompt-idx 0
 ```
 
-This will:
+`scripts/prepare_dataset.py` remains unchanged and can still be used to create/update files under `data/processed/`.
 
-- Load prompts from `data/processed/`
-- Generate model outputs
-- Compute attribution scores
-- Calculate evaluation metrics (e.g., comprehensiveness, sufficiency)
-- Store results in `outputs/`
+## Output Layout
 
----
+Per `(model, dataset)` run:
 
-## 5. Generate Visualizations
-
-After experiments have finished, create summary plots:
-
-```bash
-docker run --rm \
-  -v "$PWD/outputs:/workspace/outputs" \
-  pwm python scripts/create_visuals.py
+```text
+outputs/<model_slug>/<dataset_slug>/
+  resolved_config.yaml
+  attr_index.json
+  dimred_index.json
+  run_meta.json
+  prompts/
+    prompt_000/
+      debug.json
+      <aTag>_baseline.json
+      <aTag>_baseline_steps.csv
+      <aTag>_dimred_<dTag>.json
+      <aTag>_dimred_<dTag>_steps.csv
+      error.json            # only when failures happen
 ```
 
-Plots will be saved in:
-
-```
-outputs/plots/
-```
-
----
-
-## Project Structure
-
-```
-data/
-  processed/        # small frozen evaluation datasets (committed)
-  raw/              # optional, not tracked in git
-
-outputs/            # experiment results (not tracked)
-
-scripts/
-  run_grid.py
-  prepare_dataset.py
-  create_visuals.py
-
-configs/
-  base.yaml
-  grid.yaml
-
-docker/
-  Dockerfile
-```
-
----
-
-## Reproducibility
-
-- Fixed random seed (see `configs/base.yaml`)
-- Frozen evaluation datasets (100 samples per dataset)
-- Fully containerized execution environment
-- Results reproducible via Docker
-
----
+`aTag` / `dTag` are short stable tags; method params are stored in `attr_index.json` / `dimred_index.json`.
 
 ## Notes
 
-- Raw datasets are not included.
-- Only processed evaluation subsets are committed.
-- The Docker image intentionally excludes datasets and results.
+- Raw data under `data/raw/` is kept for completeness and is not required for `run_grid.py`.
+- The container image excludes datasets; processed prompts are expected to be mounted at runtime.

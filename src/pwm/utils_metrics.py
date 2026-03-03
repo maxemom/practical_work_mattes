@@ -48,16 +48,16 @@ def _get_next_token_probs(model, input_ids: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def _get_next_token_probs_from_embeds(model, inputs_embeds: torch.Tensor) -> torch.Tensor:
-    """
-    inputs_embeds: (1, L, D)
-    returns probs: (V,)
-    """
+    # ensure embed dtype matches model embedding dtype
+    emb_dtype = model.get_input_embeddings().weight.dtype
+    inputs_embeds = inputs_embeds.to(dtype=emb_dtype)
+
     L = inputs_embeds.shape[1]
     attention_mask = torch.ones((1, L), dtype=torch.long, device=inputs_embeds.device)
 
     out = model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-    logits = out.logits[:, -1, :]  # (1, V)
-    probs = F.softmax(logits, dim=-1).squeeze(0)  # (V,)
+    logits = out.logits[:, -1, :]
+    probs = F.softmax(logits, dim=-1).squeeze(0)
     return probs
 
 
@@ -88,14 +88,6 @@ def soft_perturb_inputs_embeds(
     input_ids: torch.Tensor,
     w_keep: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Softly perturb token embeddings via convex mixing:
-        e'_i = w_i * e_i + (1-w_i) * e_baseline
-
-    input_ids: (1, L)
-    w_keep:    (L,) in [0,1]
-    returns inputs_embeds': (1, L, D)
-    """
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise ValueError(f"input_ids must be (1,L), got {input_ids.shape}")
 
@@ -104,12 +96,17 @@ def soft_perturb_inputs_embeds(
         raise ValueError(f"w_keep must be (L,), got {w_keep.shape} for L={L}")
 
     emb_layer = model.get_input_embeddings()
-    e = emb_layer(input_ids)  # (1, L, D)
-    e_base = _baseline_embedding(model).to(e.device)  # (D,)
+    e = emb_layer(input_ids)  # (1, L, D) dtype = model dtype (often float16 on MPS)
+    e_dtype = e.dtype
 
-    w = w_keep.to(e.device).view(1, L, 1)  # (1, L, 1)
+    e_base = _baseline_embedding(model).to(device=e.device, dtype=e_dtype)  # (D,)
+
+    # >>> CRITICAL: cast weights to same dtype as embeddings <<<
+    w = w_keep.to(device=e.device, dtype=e_dtype).view(1, L, 1)  # (1, L, 1)
+
     e_pert = w * e + (1.0 - w) * e_base.view(1, 1, -1)
-    return e_pert
+    # ensure dtype stays consistent
+    return e_pert.to(dtype=e_dtype)
 
 
 def compute_soft_norm_metrics(
