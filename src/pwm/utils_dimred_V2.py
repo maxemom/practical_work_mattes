@@ -4,10 +4,35 @@ import numpy as np
 from sklearn.decomposition import FactorAnalysis, FastICA, PCA, NMF, KernelPCA
 
 
+def _normalize_method_name(method_name: str) -> str:
+    return (method_name or "").strip().lower().replace("_", "").replace(" ", "")
+
+
+def _with_seed_defaults(method_key: str, method_params: dict, seed: int | None) -> dict:
+    params = dict(method_params or {})
+    if seed is None or "random_state" in params:
+        return params
+
+    if method_key in {"factoranalysis", "ica", "nmf"}:
+        params["random_state"] = seed
+        return params
+
+    if method_key == "pca" and str(params.get("svd_solver", "auto")).lower() == "randomized":
+        params["random_state"] = seed
+        return params
+
+    if method_key == "kernelpca" and str(params.get("eigen_solver", "auto")).lower() == "randomized":
+        params["random_state"] = seed
+        return params
+
+    return params
+
+
 def reduce_raw_target(
     x: torch.Tensor,
     method_name: str,
     method_params: dict | None = None,
+    seed: int | None = None,
 ) -> torch.Tensor:
     """
     Reduziert einen Tensor von shape (total_len, gen_len, dim) auf (total_len, gen_len)
@@ -34,7 +59,8 @@ def reduce_raw_target(
     if x.ndim != 3:
         raise ValueError(f"x must have shape (total_len, gen_len, dim), got {tuple(x.shape)}")
 
-    method_params = dict(method_params or {})
+    method_key = _normalize_method_name(method_name)
+    method_params = _with_seed_defaults(method_key, method_params or {}, seed)
 
     total_len, gen_len, dim = x.shape
     if dim <= 0:
@@ -79,8 +105,6 @@ def reduce_raw_target(
         return out
 
     x_valid = x_2d_torch[valid_mask].numpy()
-
-    method_key = method_name.strip().lower()
 
     if method_key == "factoranalysis":
         reducer = FactorAnalysis(**method_params)

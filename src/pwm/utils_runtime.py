@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 
+from pwm.utils_base import deep_merge
+
 
 # -------------------------
 # Device resolution
@@ -171,6 +173,35 @@ def apply_generation_overrides(resolved: Dict[str, Any]) -> GenerationReport:
         overridden=overridden,
         source="model.params",
     )
+
+
+def build_resolved_run_config(
+    base_cfg: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    dataset_cfg: Dict[str, Any],
+    attrs: List[Dict[str, Any]],
+    dimreds: List[Dict[str, Any]],
+    chosen_device: str,
+) -> Dict[str, Any]:
+    """
+    Build the final run config for run_grid_V2.
+
+    - base_cfg["generation"] provides defaults
+    - model_cfg["params"] may override generation keys via the whitelist above
+    - the final generation config is materialized in resolved["generation"]
+    """
+    resolved = deep_merge(
+        base_cfg,
+        {
+            "model": model_cfg,
+            "dataset": dataset_cfg,
+            "attribution_functions": attrs,
+            "dimensionality_reduction_methods": dimreds,
+            "runtime": {"device": chosen_device},
+        },
+    )
+    apply_generation_overrides(resolved)
+    return resolved
 
 
 # -------------------------

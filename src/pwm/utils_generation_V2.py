@@ -5,6 +5,8 @@ from typing import Any, Dict, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from pwm.utils_pipeline import set_global_seed
+
 
 def _ensure_pad_token(tokenizer: Any) -> None:
     if getattr(tokenizer, "pad_token_id", None) is None:
@@ -12,9 +14,7 @@ def _ensure_pad_token(tokenizer: Any) -> None:
 
 
 def _set_seed(seed: int) -> None:
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
+    set_global_seed(int(seed))
 
 
 def _stabilize_model_for_mps(model: Any) -> Any:

@@ -17,7 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pwm.utils_base import deep_merge, load_yaml
+from pwm.utils_base import load_yaml
 from pwm.utils_attribution_V2 import get_raw_targets_v2
 from pwm.utils_generation_V2 import generate_output_text, load_generation_components
 from pwm.utils_dimred_V2 import reduce_raw_target
@@ -30,6 +30,7 @@ from pwm.utils_pipeline import (
     raw_target_nan_stats,
     resolve_device,
     safe_name,
+    set_global_seed,
     stabilize_model_for_metrics,
     validate_configs,
 )
@@ -38,6 +39,7 @@ from pwm.utils_results_V2 import (
     save_dimred_result_v2,
     save_json_v2,
 )
+from pwm.utils_runtime import build_resolved_run_config
 
 
 def _assert_1d_ids(name: str, x: torch.Tensor) -> None:
@@ -124,6 +126,22 @@ def _build_combinations(models: List[Dict[str, Any]], datasets: List[Dict[str, A
         for di in range(len(datasets)):
             combos.append((mi, di))
     return combos
+
+
+def _generation_seed(base_seed: int, prompt_idx: int) -> int:
+    return base_seed + 10_000 * prompt_idx
+
+
+def _attribution_seed(base_seed: int, prompt_idx: int, attr_idx: int) -> int:
+    return base_seed + 100_000 * prompt_idx + 1_000 * attr_idx
+
+
+def _baseline_metrics_seed(base_seed: int, prompt_idx: int, attr_idx: int) -> int:
+    return base_seed + 1_000_000 * prompt_idx + 10_000 * attr_idx + 1
+
+
+def _dimred_metrics_seed(base_seed: int, prompt_idx: int, attr_idx: int, dimred_idx: int) -> int:
+    return base_seed + 1_000_000 * prompt_idx + 10_000 * attr_idx + 100 * dimred_idx + 2
 
 
 def _configure_loading_verbosity(show_loading: bool) -> None:
@@ -264,9 +282,10 @@ def main() -> None:
     attr_index = build_attr_index(attrs)
     dimred_index = build_dimred_index(dimreds)
     combos = _build_combinations(models, datasets)
+    base_seed = int(base_cfg.get("seeds", {}).get("seed", 42))
 
     print("=== run_grid_V2 scaffold ===")
-    print(f"device={chosen_device} | combinations={len(combos)}")
+    print(f"device={chosen_device} | combinations={len(combos)} | base_seed={base_seed}")
 
     if args.dry_run:
         return
@@ -288,15 +307,13 @@ def main() -> None:
         prompts_root = run_dir / "prompts"
         prompts_root.mkdir(parents=True, exist_ok=True)
 
-        resolved = deep_merge(
+        resolved = build_resolved_run_config(
             base_cfg,
-            {
-                "model": model_cfg,
-                "dataset": dataset_cfg,
-                "attribution_functions": attrs,
-                "dimensionality_reduction_methods": dimreds,
-                "runtime": {"device": chosen_device},
-            },
+            model_cfg,
+            dataset_cfg,
+            attrs,
+            dimreds,
+            chosen_device,
         )
         with (run_dir / "resolved_config.yaml").open("w", encoding="utf-8") as f:
             yaml.safe_dump(resolved, f, sort_keys=False, allow_unicode=True)
@@ -313,7 +330,6 @@ def main() -> None:
             model_name=model_name,
             device=chosen_device,
         )
-        base_seed = int(base_cfg.get("seeds", {}).get("seed", 42))
         first_attr_name = attrs[0]["name"]
         inseq_model = inseq.load_model(
             model_name,
@@ -341,8 +357,7 @@ def main() -> None:
                 "notes": [],
             }
             generation_cfg = dict(resolved.get("generation", {}) or {})
-            generation_cfg.update(model_cfg.get("params", {}) or {})
-            seed_gen = base_seed + 10_000 * prompt_idx
+            seed_gen = _generation_seed(base_seed, prompt_idx)
 
             source_ids, generated_ids, full_text = generate_output_text(
                 model=hf_model,
@@ -367,11 +382,10 @@ def main() -> None:
                 "source_len": source_len,
                 "full_len": full_len,
                 "t_gen": t_gen,
+                "source_text": hf_tokenizer.decode(generated_ids[:source_len], skip_special_tokens=False),
+                "continuation_text": hf_tokenizer.decode(generated_ids[source_len:], skip_special_tokens=False),
                 "full_text_preview": full_text[:120],
             }
-            # Attribution input visibility: show text instead of only ids.
-            source_text = hf_tokenizer.decode(generated_ids[:source_len], skip_special_tokens=False)
-            continuation_text = hf_tokenizer.decode(generated_ids[source_len:], skip_special_tokens=False)
             # Ultra-low-RAM: nach BAUTEIL A nur generated_ids + source_len behalten.
             gc.collect()
             clear_device_cache(chosen_device)
@@ -381,7 +395,9 @@ def main() -> None:
             # - Pro attribution method ein raw_target Tensor.
             for a_tag, a_cfg in attr_index.items():
                 attr_name = a_cfg["name"]
+                attr_idx = int(a_cfg["index"])
                 attr_params = _prepare_attr_params_for_device(attr_name, a_cfg.get("params", {}), chosen_device)
+                seed_attr = _attribution_seed(base_seed, prompt_idx, attr_idx)
                 if can_switch_runtime or attr_name == first_attr_name:
                     model_for_attr = inseq_model
                     temp_model_loaded = False
@@ -399,6 +415,7 @@ def main() -> None:
                     model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
 
                 try:
+                    set_global_seed(seed_attr)
                     attr_out = get_raw_targets_v2(
                         inseq_model=model_for_attr,
                         prompt=prompt,
@@ -410,6 +427,7 @@ def main() -> None:
                 except Exception as exc:
                     debug_payload.setdefault("attr_debug", {})[a_tag] = {
                         "attr_name": attr_name,
+                        "seed_attr": seed_attr,
                         "status": "failed",
                         "error": str(exc),
                     }
@@ -441,6 +459,7 @@ def main() -> None:
                 )
                 debug_payload.setdefault("attr_debug", {})[a_tag] = {
                     "attr_name": attr_name,
+                    "seed_attr": seed_attr,
                     "raw_target_shape": list(raw_target.shape),
                     "source_ids_debug_len": int(attr_out.source_ids_debug.shape[0]),
                     "target_ids_debug_len": int(attr_out.target_ids_debug.shape[0]),
@@ -460,14 +479,18 @@ def main() -> None:
                     generated_ids=generated_ids,
                 )
                 metrics_model = stabilize_model_for_metrics(hf_model)
+                seed_metrics_baseline = _baseline_metrics_seed(base_seed, prompt_idx, attr_idx)
                 baseline_results = compute_soft_norm_metrics_v3(
                     metrics_model,
                     source_ids,
                     generated_ids[source_len:],
                     baseline_l2,
+                    seed=seed_metrics_baseline,
                 )
                 save_baseline_result_v2(prompt_dir, a_tag, baseline_results)
                 debug_payload["attr_debug"][a_tag]["baseline"] = {
+                    "seed_attr": seed_attr,
+                    "seed_metrics_baseline": seed_metrics_baseline,
                     "path_json": f"{a_tag}_baseline.json",
                     "path_steps_csv": f"{a_tag}_baseline_steps.csv",
                     "soft_ns_mean": float(baseline_results.soft_ns_mean),
@@ -479,9 +502,16 @@ def main() -> None:
                 # - Pro DimRed eine importance_map (L_total, T_gen)
                 for d_tag, d_cfg in dimred_index.items():
                     dimred_name = d_cfg["name"]
+                    dimred_idx = int(d_cfg["index"])
                     dimred_params = dict(d_cfg.get("params", {}) or {})
+                    seed_metrics_dimred = _dimred_metrics_seed(base_seed, prompt_idx, attr_idx, dimred_idx)
 
-                    dimred_map = reduce_raw_target(raw_target, dimred_name, dimred_params)
+                    dimred_map = reduce_raw_target(
+                        raw_target,
+                        dimred_name,
+                        dimred_params,
+                        seed=seed_metrics_dimred,
+                    )
                     _assert_importance_shape(
                         importance_map=dimred_map,
                         source_len=source_len,
@@ -492,11 +522,13 @@ def main() -> None:
                         source_ids,
                         generated_ids[source_len:],
                         dimred_map,
+                        seed=seed_metrics_dimred,
                     )
                     save_dimred_result_v2(prompt_dir, a_tag, d_tag, results)
 
                     debug_payload["attr_debug"][a_tag].setdefault("dimred", {})[d_tag] = {
                         "dimred_name": dimred_name,
+                        "seed_metrics_dimred": seed_metrics_dimred,
                         "dimred_map_shape": list(dimred_map.shape),
                         "path_json": f"{a_tag}_dimred_{d_tag}.json",
                         "path_steps_csv": f"{a_tag}_dimred_{d_tag}_steps.csv",
