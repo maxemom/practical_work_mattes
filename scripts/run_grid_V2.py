@@ -21,7 +21,7 @@ from pwm.utils_base import deep_merge, load_yaml
 from pwm.utils_attribution_V2 import get_raw_targets_v2
 from pwm.utils_generation_V2 import generate_output_text, load_generation_components
 from pwm.utils_dimred_V2 import reduce_raw_target
-from pwm.utils_metrics_V2 import compute_soft_norm_metrics
+from pwm.utils_metrics_V3 import compute_soft_norm_metrics_v3
 from pwm.utils_pipeline import (
     build_attr_index,
     build_dimred_index,
@@ -460,7 +460,7 @@ def main() -> None:
                     generated_ids=generated_ids,
                 )
                 metrics_model = stabilize_model_for_metrics(hf_model)
-                baseline_results = compute_soft_norm_metrics(
+                baseline_results = compute_soft_norm_metrics_v3(
                     metrics_model,
                     source_ids,
                     generated_ids[source_len:],
@@ -487,7 +487,7 @@ def main() -> None:
                         source_len=source_len,
                         generated_ids=generated_ids,
                     )
-                    results = compute_soft_norm_metrics(
+                    results = compute_soft_norm_metrics_v3(
                         metrics_model,
                         source_ids,
                         generated_ids[source_len:],

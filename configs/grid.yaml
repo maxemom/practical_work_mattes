@@ -5,19 +5,16 @@ models:
       do_sample: false
 
 datasets:
-  - name: tellmewhy
-    path: data/processed/tellmewhy_5_seed42.txt
+  - name: Test
+    path: data/processed/test_file.txt
 
+  - name: tellmewhy
+    path: data/processed/tellmewhy_100_seed42.txt
+
+  - name: wikitext2
+    path: data/processed/wikitest2_100_seed42.txt
 
 attribution_functions:
-  - name: gradient_shap
-    params:
-      n_samples: 2
-      stdevs: 0.01
-
-  - name: value_zeroing
-    params: {}
-
   - name: saliency
     params: {}
 
@@ -27,18 +24,70 @@ attribution_functions:
   - name: deeplift
     params: {}
 
+  - name: gradient_shap
+    params:
+      n_samples: 8
+      stdevs: 0.01
+
+  - name: value_zeroing
+    params: {}
+
+  - name: lxt
+    params: {}
+
 dimensionality_reduction_methods:
   - name: pca
-    params: { n_components: 5 }
+    params:
+      n_components: 1
 
-  - name: factoranalysis
-    params: { n_components: 5 }
+  - name: pca
+    params:
+      n_components: 2
+
+  - name: pca
+    params:
+      n_components: 5
+
+  - name: factor_analysis
+    params:
+      n_components: 1
+
+  - name: factor_analysis
+    params:
+      n_components: 2
+
+  - name: factor_analysis
+    params:
+      n_components: 5
 
   - name: ica
-    params: { n_components: 5 }
+    params:
+      n_components: 1
 
-  - name: kernelpca
-    params: { n_components: 5 }
+  - name: ica
+    params:
+      n_components: 2
+
+  - name: ica
+    params:
+      n_components: 5
+
+  - name: kernel_pca
+    params:
+      n_components: 1
+
+  - name: kernel_pca
+    params:
+      n_components: 2
 
   - name: nmf
-    params: { n_components: 5 }
+    params:
+      n_components: 1
+
+  - name: nmf
+    params:
+      n_components: 2
+
+  - name: nmf
+    params:
+      n_components: 5
