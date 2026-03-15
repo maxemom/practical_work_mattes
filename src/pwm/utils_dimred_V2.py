@@ -143,10 +143,13 @@ def reduce_raw_target(
 
     n_components = reduced.shape[1]
 
+    # Convert component outputs into a non-negative importance magnitude.
+    # For 1D projections, the sign of PCA/ICA/FA/KPCA axes is arbitrary and
+    # should not be interpreted as negative importance.
     if n_components > 1:
         reduced_scalar_valid = np.linalg.norm(reduced, ord=2, axis=1)
     else:
-        reduced_scalar_valid = reduced[:, 0]
+        reduced_scalar_valid = np.abs(reduced[:, 0])
 
     # Gesamtausgabe wieder mit NaNs an fehlenden Token-Positionen
     reduced_scalar_full = np.full((total_len * gen_len,), np.nan, dtype=np.float32)

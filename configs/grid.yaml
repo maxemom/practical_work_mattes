@@ -1,13 +1,10 @@
 models:
-  - name: Qwen/Qwen2.5-0.5B-Instruct
+  - name: Qwen/Qwen3-0.6B
     params:
-      max_new_tokens: 2
+      max_new_tokens: 10
       do_sample: false
 
 datasets:
-  - name: Test
-    path: data/processed/test_file.txt
-
   - name: tellmewhy
     path: data/processed/tellmewhy_100_seed42.txt
 
@@ -32,8 +29,6 @@ attribution_functions:
   - name: value_zeroing
     params: {}
 
-  - name: lxt
-    params: {}
 
 dimensionality_reduction_methods:
   - name: pca

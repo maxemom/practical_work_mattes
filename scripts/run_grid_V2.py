@@ -495,6 +495,10 @@ def main() -> None:
                     "path_steps_csv": f"{a_tag}_baseline_steps.csv",
                     "soft_ns_mean": float(baseline_results.soft_ns_mean),
                     "soft_nc_mean": float(baseline_results.soft_nc_mean),
+                    "mean_kept_tokens_R": float(baseline_results.mean_kept_tokens_R),
+                    "mean_kept_tokens_notR": float(baseline_results.mean_kept_tokens_notR),
+                    "rationale_size_mode": baseline_results.rationale_size_mode,
+                    "warnings": list(baseline_results.warnings),
                 }
 
                 # LOOP 4: DimRed-Methoden.
@@ -534,6 +538,10 @@ def main() -> None:
                         "path_steps_csv": f"{a_tag}_dimred_{d_tag}_steps.csv",
                         "soft_ns_mean": float(results.soft_ns_mean),
                         "soft_nc_mean": float(results.soft_nc_mean),
+                        "mean_kept_tokens_R": float(results.mean_kept_tokens_R),
+                        "mean_kept_tokens_notR": float(results.mean_kept_tokens_notR),
+                        "rationale_size_mode": results.rationale_size_mode,
+                        "warnings": list(results.warnings),
                         "status": "saved",
                     }
 

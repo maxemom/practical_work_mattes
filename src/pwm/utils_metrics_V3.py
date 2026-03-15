@@ -24,6 +24,7 @@ class SoftNormResultV3:
     mean_kept_tokens_notR: float
     num_mc_samples: int
     rationale_size_mode: str
+    warnings: List[str]
 
 
 def _hellinger_distance(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -62,9 +63,11 @@ def _sanitize_importance_column(
     step_i: int,
     eps: float = 1e-12,
 ) -> torch.Tensor:
-    col = importance_map[:target_pos, step_i].to(torch.float32)
-    col = torch.nan_to_num(col, nan=0.0, posinf=0.0, neginf=0.0)
-    col = torch.clamp(col, min=0.0)
+    raw_col = importance_map[:target_pos, step_i].to(torch.float32)
+    col = torch.nan_to_num(raw_col, nan=0.0, posinf=0.0, neginf=0.0)
+    # DimRed outputs can be signed. For faithfulness metrics we need a
+    # non-negative importance magnitude, not the arbitrary projection sign.
+    col = torch.abs(col)
 
     total = col.sum()
     if float(total) <= eps:
@@ -212,6 +215,7 @@ def compute_soft_norm_metrics_v3(
     dPnotR_list: List[float] = []
     kept_tokens_R_list: List[float] = []
     kept_tokens_notR_list: List[float] = []
+    warnings: List[str] = []
 
     generator = None
     if seed is not None:
@@ -221,6 +225,9 @@ def compute_soft_norm_metrics_v3(
     for target_pos in range(prompt_len, total_len):
         step_i = target_pos - prompt_len
         ctx_ids = total_ids[:target_pos].unsqueeze(0).to(device)
+        raw_col = importance_map[:target_pos, step_i].to(torch.float32)
+        if torch.any(torch.nan_to_num(raw_col, nan=0.0, posinf=0.0, neginf=0.0) < 0):
+            warnings.append(f"signed_importance_detected_at_step:{step_i}")
         weights = _sanitize_importance_column(importance_map, target_pos=target_pos, step_i=step_i).to(device)
 
         keep_probs_R = _build_keep_probs(
@@ -278,4 +285,5 @@ def compute_soft_norm_metrics_v3(
         mean_kept_tokens_notR=mean_kept_tokens_notR,
         num_mc_samples=int(num_mc_samples),
         rationale_size_mode=rationale_size_mode,
+        warnings=sorted(set(warnings)),
     )
