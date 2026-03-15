@@ -108,9 +108,9 @@ def stabilize_model_for_metrics(model: Any) -> Any:
 
     if device.type == "mps":
         try:
-            emb_dtype = model.get_input_embeddings().weight.dtype
-            if emb_dtype != torch.float32:
-                model.to(dtype=torch.float32)
+            # Cast the full module, not only embeddings. Some MPS failures come
+            # from later projection layers staying in bf16/fp16 while inputs are fp32.
+            model.to(dtype=torch.float32)
         except Exception:
             # best-effort only; caller keeps running
             pass

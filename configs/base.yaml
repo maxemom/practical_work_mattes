@@ -24,5 +24,4 @@ generation:
   top_p: 1.0
 
 metrics:
-  metric_stride: 1
   debug_steps: false
