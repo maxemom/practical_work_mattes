@@ -15,6 +15,8 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("sklearn")
 
 from pwm.utils_dimred_V2 import reduce_raw_target
+from pwm.utils_pipeline import build_attr_index, build_dimred_index
+from pwm.utils_results_V2 import save_baseline_result_v2, save_dimred_result_v2
 from pwm.utils_runtime import build_resolved_run_config
 
 
@@ -99,3 +101,39 @@ def test_reduce_raw_target_accepts_grid_method_names() -> None:
 
     assert factor_analysis.shape == (4, 3)
     assert kernel_pca.shape == (4, 3)
+
+
+def test_build_indices_use_readable_tags() -> None:
+    attrs = build_attr_index(
+        [
+            {"name": "saliency", "params": {}},
+            {"name": "saliency", "params": {}},
+            {"name": "input_x_gradient", "params": {}},
+        ]
+    )
+    dimreds = build_dimred_index(
+        [
+            {"name": "pca", "params": {"n_components": 1}},
+            {"name": "pca", "params": {"n_components": 2}},
+            {"name": "nmf", "params": {}},
+        ]
+    )
+
+    assert list(attrs.keys()) == ["saliency", "saliency_2", "input_x_gradient"]
+    assert list(dimreds.keys()) == ["pca_n_components_1", "pca_n_components_2", "nmf"]
+
+
+def test_v2_result_writers_only_create_json(tmp_path: Path) -> None:
+    result = {
+        "soft_ns_mean": 0.5,
+        "soft_nc_mean": 0.25,
+        "target_pos": [1],
+        "target_token_id": [7],
+    }
+
+    save_baseline_result_v2(tmp_path, "saliency", result)
+    save_dimred_result_v2(tmp_path, "saliency", "pca_n_components_2", result)
+
+    assert (tmp_path / "saliency_baseline.json").exists()
+    assert (tmp_path / "saliency_dimred_pca_n_components_2.json").exists()
+    assert not list(tmp_path.glob("*.csv"))

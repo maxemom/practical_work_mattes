@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import List, Optional
 
 import torch
@@ -13,6 +14,10 @@ class SoftNormResultV3:
     target_token_id: List[int]
     soft_ns: List[float]
     soft_nc: List[float]
+    random_soft_ns: List[float]
+    random_soft_nc: List[float]
+    log_soft_ns_over_random: List[float]
+    log_soft_nc_over_random: List[float]
     dP0: List[float]
     dPR: List[float]
     dPnotR: List[float]
@@ -20,6 +25,10 @@ class SoftNormResultV3:
     kept_tokens_notR: List[float]
     soft_ns_mean: float
     soft_nc_mean: float
+    random_soft_ns_mean: float
+    random_soft_nc_mean: float
+    log_soft_ns_over_random_mean: float
+    log_soft_nc_over_random_mean: float
     mean_kept_tokens_R: float
     mean_kept_tokens_notR: float
     num_mc_samples: int
@@ -57,6 +66,20 @@ def _zero_baseline_embedding(model, device: torch.device) -> torch.Tensor:
     return torch.zeros(emb_weight.shape[1], device=device, dtype=emb_weight.dtype)
 
 
+def _make_cpu_generator(seed: Optional[int]) -> Optional[torch.Generator]:
+    if seed is None:
+        return None
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _step_seed(base_seed: Optional[int], step_i: int, stream_offset: int) -> Optional[int]:
+    if base_seed is None:
+        return None
+    return int(base_seed) + 10_000 * int(step_i) + int(stream_offset)
+
+
 def _sanitize_importance_column(
     importance_map: torch.Tensor,
     target_pos: int,
@@ -75,6 +98,19 @@ def _sanitize_importance_column(
             f"Importance values sum to ~0 for step_i={step_i}, target_pos={target_pos}"
         )
     return col / total
+
+
+def _random_importance_weights(
+    target_pos: int,
+    *,
+    generator: Optional[torch.Generator],
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    weights = torch.rand((target_pos,), dtype=torch.float32, generator=generator)
+    total = weights.sum()
+    if float(total) <= eps:
+        return torch.full((target_pos,), 1.0 / max(1, target_pos), dtype=torch.float32)
+    return weights / total
 
 
 def _effective_support_size(weights: torch.Tensor, eps: float = 1e-12) -> float:
@@ -154,7 +190,10 @@ def _sampled_distribution_average(
 ) -> torch.Tensor:
     prob_sum = None
     for _ in range(num_samples):
-        mask = torch.bernoulli(keep_probs, generator=generator)
+        mask = torch.bernoulli(
+            keep_probs.detach().to(device="cpu", dtype=torch.float32),
+            generator=generator,
+        ).to(device=keep_probs.device, dtype=keep_probs.dtype)
         embeds = _perturb_inputs_embeds_with_mask(model, input_ids, mask)
         probs = _get_next_token_probs_from_embeds(model, embeds)
         if prob_sum is None:
@@ -162,6 +201,12 @@ def _sampled_distribution_average(
         else:
             prob_sum = prob_sum + probs
     return prob_sum / float(num_samples)
+
+
+def _compute_soft_scores(dP0: float, dP_R: float, dP_notR: float) -> tuple[float, float]:
+    if dP0 <= 0.0:
+        return 0.0, 0.0
+    return max(0.0, (dP0 - dP_R) / dP0), max(0.0, dP_notR / dP0)
 
 
 def compute_soft_norm_metrics_v3(
@@ -210,17 +255,17 @@ def compute_soft_norm_metrics_v3(
     target_token_id_list: List[int] = []
     soft_ns_list: List[float] = []
     soft_nc_list: List[float] = []
+    random_soft_ns_list: List[float] = []
+    random_soft_nc_list: List[float] = []
+    log_soft_ns_over_random_list: List[float] = []
+    log_soft_nc_over_random_list: List[float] = []
     dP0_list: List[float] = []
     dPR_list: List[float] = []
     dPnotR_list: List[float] = []
     kept_tokens_R_list: List[float] = []
     kept_tokens_notR_list: List[float] = []
     warnings: List[str] = []
-
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=device)
-        generator.manual_seed(seed)
+    eps = 1e-12
 
     for target_pos in range(prompt_len, total_len):
         step_i = target_pos - prompt_len
@@ -238,26 +283,83 @@ def compute_soft_norm_metrics_v3(
         keep_probs_notR = 1.0 - keep_probs_R
         keep_probs_zero = torch.zeros_like(keep_probs_R)
 
+        random_weights = _random_importance_weights(
+            target_pos,
+            generator=_make_cpu_generator(_step_seed(seed, step_i, 20)),
+        ).to(device)
+        keep_probs_random_R = _build_keep_probs(
+            random_weights,
+            rationale_size_mode=rationale_size_mode,
+            rationale_fraction=rationale_fraction,
+        )
+        keep_probs_random_notR = 1.0 - keep_probs_random_R
+        keep_probs_random_zero = torch.zeros_like(keep_probs_random_R)
+
         p_full = _get_next_token_probs(model, ctx_ids)
-        p_R = _sampled_distribution_average(model, ctx_ids, keep_probs_R, num_mc_samples, generator)
-        p_notR = _sampled_distribution_average(model, ctx_ids, keep_probs_notR, num_mc_samples, generator)
-        p_0 = _sampled_distribution_average(model, ctx_ids, keep_probs_zero, num_mc_samples, generator)
+        p_R = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_R,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 100)),
+        )
+        p_notR = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_notR,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 200)),
+        )
+        p_0 = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_zero,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 300)),
+        )
+
+        p_random_R = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_random_R,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 400)),
+        )
+        p_random_notR = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_random_notR,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 500)),
+        )
+        p_random_0 = _sampled_distribution_average(
+            model,
+            ctx_ids,
+            keep_probs_random_zero,
+            num_mc_samples,
+            _make_cpu_generator(_step_seed(seed, step_i, 600)),
+        )
 
         dP_R = float(_hellinger_distance(p_full, p_R).item()) # distance between predictions full context and only rationales
         dP_notR = float(_hellinger_distance(p_full, p_notR).item())
         dP0 = float(_hellinger_distance(p_full, p_0).item())
+        random_dP_R = float(_hellinger_distance(p_full, p_random_R).item())
+        random_dP_notR = float(_hellinger_distance(p_full, p_random_notR).item())
+        random_dP0 = float(_hellinger_distance(p_full, p_random_0).item())
 
-        if dP0 <= 0.0:
-            soft_ns = 0.0
-            soft_nc = 0.0
-        else:
-            soft_ns = max(0.0, (dP0 - dP_R) / dP0)
-            soft_nc = max(0.0, dP_notR / dP0)
+        soft_ns, soft_nc = _compute_soft_scores(dP0, dP_R, dP_notR)
+        random_soft_ns, random_soft_nc = _compute_soft_scores(random_dP0, random_dP_R, random_dP_notR)
+        log_soft_ns_over_random = math.log(max(soft_ns, eps) / max(random_soft_ns, eps))
+        log_soft_nc_over_random = math.log(max(soft_nc, eps) / max(random_soft_nc, eps))
 
         target_pos_list.append(int(target_pos))
         target_token_id_list.append(int(total_ids[target_pos].item()))
         soft_ns_list.append(float(soft_ns))
         soft_nc_list.append(float(soft_nc))
+        random_soft_ns_list.append(float(random_soft_ns))
+        random_soft_nc_list.append(float(random_soft_nc))
+        log_soft_ns_over_random_list.append(float(log_soft_ns_over_random))
+        log_soft_nc_over_random_list.append(float(log_soft_nc_over_random))
         dP0_list.append(float(dP0))
         dPR_list.append(float(dP_R))
         dPnotR_list.append(float(dP_notR))
@@ -266,6 +368,14 @@ def compute_soft_norm_metrics_v3(
 
     soft_ns_mean = float(sum(soft_ns_list) / max(1, len(soft_ns_list)))
     soft_nc_mean = float(sum(soft_nc_list) / max(1, len(soft_nc_list)))
+    random_soft_ns_mean = float(sum(random_soft_ns_list) / max(1, len(random_soft_ns_list)))
+    random_soft_nc_mean = float(sum(random_soft_nc_list) / max(1, len(random_soft_nc_list)))
+    log_soft_ns_over_random_mean = float(
+        sum(log_soft_ns_over_random_list) / max(1, len(log_soft_ns_over_random_list))
+    )
+    log_soft_nc_over_random_mean = float(
+        sum(log_soft_nc_over_random_list) / max(1, len(log_soft_nc_over_random_list))
+    )
     mean_kept_tokens_R = float(sum(kept_tokens_R_list) / max(1, len(kept_tokens_R_list)))
     mean_kept_tokens_notR = float(sum(kept_tokens_notR_list) / max(1, len(kept_tokens_notR_list)))
 
@@ -274,6 +384,10 @@ def compute_soft_norm_metrics_v3(
         target_token_id=target_token_id_list,
         soft_ns=soft_ns_list,
         soft_nc=soft_nc_list,
+        random_soft_ns=random_soft_ns_list,
+        random_soft_nc=random_soft_nc_list,
+        log_soft_ns_over_random=log_soft_ns_over_random_list,
+        log_soft_nc_over_random=log_soft_nc_over_random_list,
         dP0=dP0_list,
         dPR=dPR_list,
         dPnotR=dPnotR_list,
@@ -281,6 +395,10 @@ def compute_soft_norm_metrics_v3(
         kept_tokens_notR=kept_tokens_notR_list,
         soft_ns_mean=soft_ns_mean,
         soft_nc_mean=soft_nc_mean,
+        random_soft_ns_mean=random_soft_ns_mean,
+        random_soft_nc_mean=random_soft_nc_mean,
+        log_soft_ns_over_random_mean=log_soft_ns_over_random_mean,
+        log_soft_nc_over_random_mean=log_soft_nc_over_random_mean,
         mean_kept_tokens_R=mean_kept_tokens_R,
         mean_kept_tokens_notR=mean_kept_tokens_notR,
         num_mc_samples=int(num_mc_samples),

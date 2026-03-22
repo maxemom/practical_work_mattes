@@ -1,15 +1,15 @@
 models:
   - name: Qwen/Qwen3-0.6B
     params:
-      max_new_tokens: 10
+      max_new_tokens: 5
       do_sample: false
 
 datasets:
   - name: tellmewhy
-    path: data/processed/tellmewhy_100_seed42.txt
+    path: data/processed/tellmewhy_5_seed42.txt
 
   - name: wikitext2
-    path: data/processed/wikitest2_100_seed42.txt
+    path: data/processed/wikitest2_5_seed42.txt
 
 attribution_functions:
   - name: saliency
@@ -35,54 +35,18 @@ dimensionality_reduction_methods:
     params:
       n_components: 1
 
-  - name: pca
-    params:
-      n_components: 2
-
-  - name: pca
-    params:
-      n_components: 5
-
   - name: factor_analysis
     params:
       n_components: 1
 
-  - name: factor_analysis
-    params:
-      n_components: 2
-
-  - name: factor_analysis
-    params:
-      n_components: 5
-
   - name: ica
     params:
       n_components: 1
-
-  - name: ica
-    params:
-      n_components: 2
-
-  - name: ica
-    params:
-      n_components: 5
 
   - name: kernel_pca
     params:
       n_components: 1
 
-  - name: kernel_pca
-    params:
-      n_components: 2
-
   - name: nmf
     params:
       n_components: 1
-
-  - name: nmf
-    params:
-      n_components: 2
-
-  - name: nmf
-    params:
-      n_components: 5

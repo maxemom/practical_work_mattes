@@ -4,6 +4,7 @@ import argparse
 import gc
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -19,7 +20,11 @@ if str(SRC) not in sys.path:
 
 from pwm.utils_base import load_yaml
 from pwm.utils_attribution_V2 import get_raw_targets_v2
-from pwm.utils_generation_V2 import generate_output_text, load_generation_components
+from pwm.utils_generation_V2 import (
+    generate_output_text,
+    load_generation_model,
+    load_generation_tokenizer,
+)
 from pwm.utils_dimred_V2 import reduce_raw_target
 from pwm.utils_metrics_V3 import compute_soft_norm_metrics_v3
 from pwm.utils_pipeline import (
@@ -32,7 +37,6 @@ from pwm.utils_pipeline import (
     safe_name,
     set_global_seed,
     stabilize_model_for_metrics,
-    validate_configs,
 )
 from pwm.utils_results_V2 import (
     save_baseline_result_v2,
@@ -140,6 +144,10 @@ def _baseline_metrics_seed(base_seed: int, prompt_idx: int, attr_idx: int) -> in
     return base_seed + 1_000_000 * prompt_idx + 10_000 * attr_idx + 1
 
 
+def _dimred_seed(base_seed: int, prompt_idx: int, attr_idx: int, dimred_idx: int) -> int:
+    return base_seed + 500_000 * prompt_idx + 5_000 * attr_idx + 10 * dimred_idx + 1
+
+
 def _dimred_metrics_seed(base_seed: int, prompt_idx: int, attr_idx: int, dimred_idx: int) -> int:
     return base_seed + 1_000_000 * prompt_idx + 10_000 * attr_idx + 100 * dimred_idx + 2
 
@@ -221,6 +229,7 @@ def l2_norm_over_dim(raw_target: torch.Tensor) -> torch.Tensor:
 
     return l2_map
 
+
 def column_softmax_with_nan(x: torch.Tensor) -> torch.Tensor:
     """
     Input:
@@ -248,12 +257,136 @@ def column_softmax_with_nan(x: torch.Tensor) -> torch.Tensor:
     return softmax
 
 
+def _metrics_kwargs(metrics_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "num_mc_samples": int(metrics_cfg.get("num_mc_samples", 8)),
+        "rationale_size_mode": str(metrics_cfg.get("rationale_size_mode", "all_mass")),
+        "rationale_fraction": float(metrics_cfg.get("rationale_fraction", 0.2)),
+    }
+
+
+def _resolve_dimred_workers(
+    requested_workers: int | None,
+    dimred_count: int,
+    raw_target: torch.Tensor,
+) -> int:
+    if dimred_count <= 1:
+        return 1
+
+    if requested_workers is not None:
+        return max(1, min(int(requested_workers), dimred_count))
+
+    cpu_count = os.cpu_count() or 1
+    raw_target_gb = raw_target.numel() * raw_target.element_size() / float(1024**3)
+
+    # Each reducer creates additional NumPy/sklearn working buffers. On unified
+    # memory machines that can spike quickly, so "auto" stays intentionally
+    # conservative while still using more than one core.
+    if raw_target_gb >= 1.0:
+        auto_workers = 2
+    elif raw_target_gb >= 0.35:
+        auto_workers = 3
+    else:
+        auto_workers = 4
+
+    return max(1, min(dimred_count, auto_workers, cpu_count))
+
+
+def _compute_dimred_map(
+    raw_target: torch.Tensor,
+    d_cfg: Dict[str, Any],
+    *,
+    seed: int,
+) -> torch.Tensor:
+    return reduce_raw_target(
+        raw_target,
+        d_cfg["name"],
+        dict(d_cfg.get("params", {}) or {}),
+        seed=seed,
+    )
+
+
+def _build_importance_maps(
+    raw_target: torch.Tensor,
+    source_len: int,
+    generated_ids: torch.Tensor,
+    dimred_index: Dict[str, Dict[str, Any]],
+    *,
+    base_seed: int,
+    prompt_idx: int,
+    attr_idx: int,
+    dimred_workers: int | None,
+) -> Tuple[torch.Tensor, Dict[str, Dict[str, Any]], int]:
+    baseline_l2 = l2_norm_over_dim(raw_target)
+    _assert_importance_shape(
+        importance_map=baseline_l2,
+        source_len=source_len,
+        generated_ids=generated_ids,
+    )
+
+    dimred_maps: Dict[str, Dict[str, Any]] = {}
+    resolved_workers = _resolve_dimred_workers(dimred_workers, len(dimred_index), raw_target)
+    dimred_jobs: List[Tuple[str, Dict[str, Any], int]] = []
+    for d_tag, d_cfg in dimred_index.items():
+        dimred_idx = int(d_cfg["index"])
+        dimred_jobs.append((d_tag, d_cfg, _dimred_seed(base_seed, prompt_idx, attr_idx, dimred_idx)))
+
+    if resolved_workers == 1:
+        for d_tag, d_cfg, dimred_seed in dimred_jobs:
+            dimred_map = _compute_dimred_map(raw_target, d_cfg, seed=dimred_seed)
+            _assert_importance_shape(
+                importance_map=dimred_map,
+                source_len=source_len,
+                generated_ids=generated_ids,
+            )
+            dimred_maps[d_tag] = {
+                "name": d_cfg["name"],
+                "params": dict(d_cfg.get("params", {}) or {}),
+                "seed_dimred": dimred_seed,
+                "importance_map": dimred_map,
+            }
+        return baseline_l2, dimred_maps, resolved_workers
+
+    futures = {}
+    completed_maps: Dict[str, torch.Tensor] = {}
+    with ThreadPoolExecutor(max_workers=resolved_workers) as executor:
+        for d_tag, d_cfg, dimred_seed in dimred_jobs:
+            future = executor.submit(_compute_dimred_map, raw_target, d_cfg, seed=dimred_seed)
+            futures[future] = (d_tag, d_cfg, dimred_seed)
+
+        for future in as_completed(futures):
+            d_tag, d_cfg, dimred_seed = futures[future]
+            dimred_map = future.result()
+            _assert_importance_shape(
+                importance_map=dimred_map,
+                source_len=source_len,
+                generated_ids=generated_ids,
+            )
+            completed_maps[d_tag] = dimred_map
+
+    for d_tag, d_cfg, dimred_seed in dimred_jobs:
+        dimred_maps[d_tag] = {
+                "name": d_cfg["name"],
+                "params": dict(d_cfg.get("params", {}) or {}),
+                "seed_dimred": dimred_seed,
+                "importance_map": completed_maps[d_tag],
+        }
+
+    return baseline_l2, dimred_maps, resolved_workers
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Step-by-step Scaffold fuer die neue Attribution-Pipeline.")
     parser.add_argument("--base", type=str, default="configs/base.yaml")
     parser.add_argument("--grid", type=str, default="configs/grid.yaml")
     parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--dimred-workers",
+        type=int,
+        default=None,
+        help="Parallel workers for dim-red per prompt/attribution. Default: auto-conservative.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--show-loading",
@@ -322,23 +455,9 @@ def main() -> None:
 
         prompts = load_prompts(dataset_cfg, args.max_prompts)
         print(f"[{run_i}/{len(combos)}] model={model_name} dataset={dataset_name} prompts={len(prompts)}")
-
-        # BAUTEIL A: Generation-Komponenten einmal pro Kombination laden.
-        # Erwarteter Output:
-        # - hf_model / tokenizer, die in der Prompt-Schleife wiederverwendet werden.
-        hf_model, hf_tokenizer = load_generation_components(
-            model_name=model_name,
-            device=chosen_device,
-        )
-        first_attr_name = attrs[0]["name"]
-        inseq_model = inseq.load_model(
-            model_name,
-            attribution_method=first_attr_name,
-            device=chosen_device,
-        )
-        if chosen_device == "mps":
-            inseq_model.model = stabilize_model_for_metrics(inseq_model.model)
-        can_switch_runtime = hasattr(inseq_model, "load_attribution_method")
+        hf_tokenizer = load_generation_tokenizer(model_name)
+        metrics_cfg = dict(resolved.get("metrics", {}) or {})
+        metric_kwargs = _metrics_kwargs(metrics_cfg)
 
         # LOOP 2: Prompt-Ebene.
         # Erwarteter Output:
@@ -359,13 +478,18 @@ def main() -> None:
             generation_cfg = dict(resolved.get("generation", {}) or {})
             seed_gen = _generation_seed(base_seed, prompt_idx)
 
+            generation_model = load_generation_model(
+                model_name=model_name,
+                device=chosen_device,
+            )
             source_ids, generated_ids, full_text = generate_output_text(
-                model=hf_model,
+                model=generation_model,
                 tokenizer=hf_tokenizer,
                 prompt=prompt,
                 generation_cfg=generation_cfg,
                 seed=seed_gen,
             )
+            del generation_model
             source_len = int(source_ids.shape[0])
             full_len = int(generated_ids.shape[0])
             t_gen = full_len - source_len
@@ -386,7 +510,6 @@ def main() -> None:
                 "continuation_text": hf_tokenizer.decode(generated_ids[source_len:], skip_special_tokens=False),
                 "full_text_preview": full_text[:120],
             }
-            # Ultra-low-RAM: nach BAUTEIL A nur generated_ids + source_len behalten.
             gc.collect()
             clear_device_cache(chosen_device)
 
@@ -398,18 +521,11 @@ def main() -> None:
                 attr_idx = int(a_cfg["index"])
                 attr_params = _prepare_attr_params_for_device(attr_name, a_cfg.get("params", {}), chosen_device)
                 seed_attr = _attribution_seed(base_seed, prompt_idx, attr_idx)
-                if can_switch_runtime or attr_name == first_attr_name:
-                    model_for_attr = inseq_model
-                    temp_model_loaded = False
-                else:
-                    model_for_attr = inseq.load_model(
-                        model_name,
-                        attribution_method=attr_name,
-                        device=chosen_device,
-                    )
-                    if chosen_device == "mps":
-                        model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
-                    temp_model_loaded = True
+                model_for_attr = inseq.load_model(
+                    model_name,
+                    attribution_method=attr_name,
+                    device=chosen_device,
+                )
 
                 if chosen_device == "mps" and _needs_mps_fp32_for_attr(attr_name):
                     model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
@@ -444,8 +560,7 @@ def main() -> None:
                             f"[warn] prompt_{prompt_idx:03d} attr={a_tag} failed: {exc}",
                             flush=True,
                         )
-                    if temp_model_loaded:
-                        del model_for_attr
+                    del model_for_attr
                     gc.collect()
                     clear_device_cache(chosen_device)
                     continue
@@ -472,29 +587,54 @@ def main() -> None:
                     f"active_nan_ratio={nan_stats['active_nan_ratio']:.6f}",
                     flush=True,
                 )
-                baseline_l2 = l2_norm_over_dim(raw_target)
-                _assert_importance_shape(
-                    importance_map=baseline_l2,
+                del model_for_attr
+                gc.collect()
+                clear_device_cache(chosen_device)
+
+                baseline_l2, dimred_maps, dimred_workers = _build_importance_maps(
+                    raw_target=raw_target,
                     source_len=source_len,
                     generated_ids=generated_ids,
+                    dimred_index=dimred_index,
+                    base_seed=base_seed,
+                    prompt_idx=prompt_idx,
+                    attr_idx=attr_idx,
+                    dimred_workers=args.dimred_workers,
                 )
-                metrics_model = stabilize_model_for_metrics(hf_model)
+                debug_payload["attr_debug"][a_tag]["dimred_parallel_workers"] = int(dimred_workers)
+
+                del attr_out
+                del raw_target
+                gc.collect()
+                clear_device_cache(chosen_device)
+
                 seed_metrics_baseline = _baseline_metrics_seed(base_seed, prompt_idx, attr_idx)
+                set_global_seed(seed_metrics_baseline)
+                metrics_model = load_generation_model(
+                    model_name=model_name,
+                    device=chosen_device,
+                )
+                if chosen_device == "mps":
+                    metrics_model = stabilize_model_for_metrics(metrics_model)
                 baseline_results = compute_soft_norm_metrics_v3(
                     metrics_model,
                     source_ids,
                     generated_ids[source_len:],
                     baseline_l2,
                     seed=seed_metrics_baseline,
+                    **metric_kwargs,
                 )
                 save_baseline_result_v2(prompt_dir, a_tag, baseline_results)
                 debug_payload["attr_debug"][a_tag]["baseline"] = {
                     "seed_attr": seed_attr,
                     "seed_metrics_baseline": seed_metrics_baseline,
                     "path_json": f"{a_tag}_baseline.json",
-                    "path_steps_csv": f"{a_tag}_baseline_steps.csv",
                     "soft_ns_mean": float(baseline_results.soft_ns_mean),
                     "soft_nc_mean": float(baseline_results.soft_nc_mean),
+                    "random_soft_ns_mean": float(baseline_results.random_soft_ns_mean),
+                    "random_soft_nc_mean": float(baseline_results.random_soft_nc_mean),
+                    "log_soft_ns_over_random_mean": float(baseline_results.log_soft_ns_over_random_mean),
+                    "log_soft_nc_over_random_mean": float(baseline_results.log_soft_nc_over_random_mean),
                     "mean_kept_tokens_R": float(baseline_results.mean_kept_tokens_R),
                     "mean_kept_tokens_notR": float(baseline_results.mean_kept_tokens_notR),
                     "rationale_size_mode": baseline_results.rationale_size_mode,
@@ -504,40 +644,34 @@ def main() -> None:
                 # LOOP 4: DimRed-Methoden.
                 # Erwarteter Output:
                 # - Pro DimRed eine importance_map (L_total, T_gen)
-                for d_tag, d_cfg in dimred_index.items():
-                    dimred_name = d_cfg["name"]
-                    dimred_idx = int(d_cfg["index"])
-                    dimred_params = dict(d_cfg.get("params", {}) or {})
+                for d_tag, d_state in dimred_maps.items():
+                    dimred_name = d_state["name"]
+                    dimred_idx = int(dimred_index[d_tag]["index"])
                     seed_metrics_dimred = _dimred_metrics_seed(base_seed, prompt_idx, attr_idx, dimred_idx)
-
-                    dimred_map = reduce_raw_target(
-                        raw_target,
-                        dimred_name,
-                        dimred_params,
-                        seed=seed_metrics_dimred,
-                    )
-                    _assert_importance_shape(
-                        importance_map=dimred_map,
-                        source_len=source_len,
-                        generated_ids=generated_ids,
-                    )
+                    set_global_seed(seed_metrics_dimred)
                     results = compute_soft_norm_metrics_v3(
                         metrics_model,
                         source_ids,
                         generated_ids[source_len:],
-                        dimred_map,
+                        d_state["importance_map"],
                         seed=seed_metrics_dimred,
+                        **metric_kwargs,
                     )
                     save_dimred_result_v2(prompt_dir, a_tag, d_tag, results)
 
                     debug_payload["attr_debug"][a_tag].setdefault("dimred", {})[d_tag] = {
                         "dimred_name": dimred_name,
+                        "dimred_params": d_state["params"],
+                        "seed_dimred": d_state["seed_dimred"],
                         "seed_metrics_dimred": seed_metrics_dimred,
-                        "dimred_map_shape": list(dimred_map.shape),
+                        "dimred_map_shape": list(d_state["importance_map"].shape),
                         "path_json": f"{a_tag}_dimred_{d_tag}.json",
-                        "path_steps_csv": f"{a_tag}_dimred_{d_tag}_steps.csv",
                         "soft_ns_mean": float(results.soft_ns_mean),
                         "soft_nc_mean": float(results.soft_nc_mean),
+                        "random_soft_ns_mean": float(results.random_soft_ns_mean),
+                        "random_soft_nc_mean": float(results.random_soft_nc_mean),
+                        "log_soft_ns_over_random_mean": float(results.log_soft_ns_over_random_mean),
+                        "log_soft_nc_over_random_mean": float(results.log_soft_nc_over_random_mean),
                         "mean_kept_tokens_R": float(results.mean_kept_tokens_R),
                         "mean_kept_tokens_notR": float(results.mean_kept_tokens_notR),
                         "rationale_size_mode": results.rationale_size_mode,
@@ -547,19 +681,16 @@ def main() -> None:
 
                 # RAM-Hygiene pro Attribution-Methode:
                 # Hier gezielt aufraeumen, damit keine grossen Tensoren im Speicher verbleiben.
-                del attr_out
-                del raw_target
                 del baseline_l2
                 del metrics_model
-                if temp_model_loaded:
-                    del model_for_attr
+                for d_state in dimred_maps.values():
+                    del d_state["importance_map"]
                 gc.collect()
                 clear_device_cache(chosen_device)
 
+            debug_payload["status"] = "completed"
             save_json_v2(prompt_dir / "debug.json", debug_payload)
 
-        del inseq_model
-        del hf_model
         del hf_tokenizer
         gc.collect()
         clear_device_cache(chosen_device)

@@ -47,18 +47,42 @@ def name_prefix(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower()) or "x"
 
 
+def _tag_value(value: Any) -> str:
+    return safe_name(str(value))
+
+
+def _unique_tag(candidate: str, used: set[str]) -> str:
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+
+    suffix = 2
+    while True:
+        tagged = f"{candidate}_{suffix}"
+        if tagged not in used:
+            used.add(tagged)
+            return tagged
+        suffix += 1
+
+
 def build_attr_index(attrs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    used: set[str] = set()
     for idx, cfg in enumerate(attrs):
-        tag = f"{name_prefix(cfg.get('name', 'attr'))}{idx}"
+        tag = _unique_tag(safe_name(cfg.get("name", "attr")), used)
         out[tag] = {"name": cfg.get("name"), "params": cfg.get("params", {}) or {}, "index": idx}
     return out
 
 
 def build_dimred_index(dimreds: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
+    used: set[str] = set()
     for idx, cfg in enumerate(dimreds):
-        tag = f"{name_prefix(cfg.get('name', 'dimred'))}{idx}"
+        params = cfg.get("params", {}) or {}
+        tag = safe_name(cfg.get("name", "dimred"))
+        if "n_components" in params:
+            tag = f"{tag}_n_components_{_tag_value(params['n_components'])}"
+        tag = _unique_tag(tag, used)
         out[tag] = {"name": cfg.get("name"), "params": cfg.get("params", {}) or {}, "index": idx}
     return out
 

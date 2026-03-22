@@ -35,6 +35,20 @@ def _stabilize_model_for_mps(model: Any) -> Any:
     return model
 
 
+def load_generation_tokenizer(model_name: str) -> Any:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    _ensure_pad_token(tokenizer)
+    return tokenizer
+
+
+def load_generation_model(model_name: str, device: str) -> Any:
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = model.to(device)
+    model = _stabilize_model_for_mps(model)
+    model.eval()
+    return model
+
+
 def load_generation_components(model_name: str, device: str) -> Tuple[Any, Any]:
     """
     Laedt HF-Model und Tokenizer fuer reine Generation.
@@ -43,13 +57,8 @@ def load_generation_components(model_name: str, device: str) -> Tuple[Any, Any]:
     - model: HF causal LM (bereits auf device)
     - tokenizer
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    _ensure_pad_token(tokenizer)
-
-    model = AutoModelForCausalLM.from_pretrained(model_name)
-    model = model.to(device)
-    model = _stabilize_model_for_mps(model)
-    model.eval()
+    tokenizer = load_generation_tokenizer(model_name)
+    model = load_generation_model(model_name, device)
     return model, tokenizer
 
 
