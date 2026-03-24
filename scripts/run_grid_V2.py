@@ -19,7 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from pwm.utils_base import load_yaml
-from pwm.utils_attribution_V2 import get_raw_targets_v2
+from pwm.utils_attribution_V2 import get_raw_targets_lxt_v2, get_raw_targets_v2
 from pwm.utils_generation_V2 import (
     generate_output_text,
     load_generation_model,
@@ -181,6 +181,7 @@ def _needs_mps_fp32_for_attr(attr_name: str) -> bool:
         "gradient_shap",
         "deeplift",
         "integrated_gradients",
+        "lxt",
     }
 
 
@@ -521,25 +522,43 @@ def main() -> None:
                 attr_idx = int(a_cfg["index"])
                 attr_params = _prepare_attr_params_for_device(attr_name, a_cfg.get("params", {}), chosen_device)
                 seed_attr = _attribution_seed(base_seed, prompt_idx, attr_idx)
-                model_for_attr = inseq.load_model(
-                    model_name,
-                    attribution_method=attr_name,
-                    device=chosen_device,
-                )
+                is_lxt = (attr_name or "").lower() == "lxt"
 
-                if chosen_device == "mps" and _needs_mps_fp32_for_attr(attr_name):
-                    model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
+                if is_lxt:
+                    model_for_attr = load_generation_model(
+                        model_name=model_name,
+                        device=chosen_device,
+                    )
+                    if chosen_device == "mps" and _needs_mps_fp32_for_attr(attr_name):
+                        model_for_attr = stabilize_model_for_metrics(model_for_attr)
+                else:
+                    model_for_attr = inseq.load_model(
+                        model_name,
+                        attribution_method=attr_name,
+                        device=chosen_device,
+                    )
+
+                    if chosen_device == "mps" and _needs_mps_fp32_for_attr(attr_name):
+                        model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
 
                 try:
                     set_global_seed(seed_attr)
-                    attr_out = get_raw_targets_v2(
-                        inseq_model=model_for_attr,
-                        prompt=prompt,
-                        generated_ids=generated_ids,
-                        source_len=source_len,
-                        attr_name=attr_name,
-                        attr_params=attr_params,
-                    )
+                    if is_lxt:
+                        attr_out = get_raw_targets_lxt_v2(
+                            model=model_for_attr,
+                            generated_ids=generated_ids,
+                            source_len=source_len,
+                            attr_params=attr_params,
+                        )
+                    else:
+                        attr_out = get_raw_targets_v2(
+                            inseq_model=model_for_attr,
+                            prompt=prompt,
+                            generated_ids=generated_ids,
+                            source_len=source_len,
+                            attr_name=attr_name,
+                            attr_params=attr_params,
+                        )
                 except Exception as exc:
                     debug_payload.setdefault("attr_debug", {})[a_tag] = {
                         "attr_name": attr_name,

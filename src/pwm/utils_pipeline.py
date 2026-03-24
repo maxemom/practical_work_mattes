@@ -19,6 +19,7 @@ ALLOWED_ATTR_METHODS = {
     "integrated_gradients",
     "deeplift",
     "gradient_shap",
+    "lxt",
     "value_zeroing",
     "occlusion",
     "lime",
