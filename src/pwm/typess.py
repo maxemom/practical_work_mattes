@@ -38,6 +38,12 @@ class MethodResult:
     target_token_ids: List[int] = field(default_factory=list)
     target_token_texts: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    attribution_device: Optional[str] = None
+    attribution_elapsed_ms: Optional[float] = None
+    attribution_step_times_ms: List[float] = field(default_factory=list)
+    dimred_elapsed_ms: Optional[float] = None
+    metrics_elapsed_ms: Optional[float] = None
+    combo_elapsed_ms: Optional[float] = None
     skipped: bool = False
     skip_reason: Optional[str] = None
 

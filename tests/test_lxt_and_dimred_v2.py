@@ -18,6 +18,7 @@ pytest.importorskip("sklearn")
 
 from pwm.utils_attribution_V2 import get_raw_targets_lxt_v2
 from pwm.utils_dimred_V2 import reduce_raw_target
+from pwm.main_function import ExperimentRuntime
 
 
 class TinyCausalLM(nn.Module):
@@ -108,3 +109,71 @@ def test_get_raw_targets_lxt_v2_returns_pipeline_shape(monkeypatch: pytest.Monke
     assert torch.isnan(result.raw_target[4:, 1, :]).all()
     assert result.source_ids_debug.tolist() == [1, 2, 3]
     assert result.target_ids_debug.tolist() == [1, 2, 3, 4, 5]
+
+
+def test_get_raw_targets_lxt_v2_records_step_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    efficient_mod = types.ModuleType("lxt.efficient")
+    efficient_mod.monkey_patch = lambda model_module, verbose=False: None
+    lxt_mod = types.ModuleType("lxt")
+    lxt_mod.efficient = efficient_mod
+    monkeypatch.setitem(sys.modules, "lxt", lxt_mod)
+    monkeypatch.setitem(sys.modules, "lxt.efficient", efficient_mod)
+
+    torch.manual_seed(0)
+    model = TinyCausalLM()
+    generated_ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+
+    result = get_raw_targets_lxt_v2(
+        model=model,
+        generated_ids=generated_ids,
+        source_len=3,
+        attr_params={"log_step_times": False},
+    )
+
+    assert result.device == "cpu"
+    assert result.elapsed_ms >= 0.0
+    assert result.step_times_ms is not None
+    assert len(result.step_times_ms) == 2
+    assert all(step_ms >= 0.0 for step_ms in result.step_times_ms)
+
+
+class _RecordingWrapper:
+    def __init__(self, model: nn.Module, device: str = "cpu") -> None:
+        self.model = model
+        self.device = device
+
+
+def test_experiment_runtime_move_to_device_updates_cached_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    hf_model = TinyCausalLM()
+    primary = _RecordingWrapper(hf_model, device="cpu")
+    cached_model = TinyCausalLM()
+    cached = _RecordingWrapper(cached_model, device="cpu")
+
+    runtime = ExperimentRuntime(
+        model_name="demo",
+        device="cpu",
+        model_dtype_name="float32",
+        hf_model=hf_model,
+        tokenizer=None,
+        primary_attr_name="saliency",
+        primary_inseq_model=primary,
+        can_switch_runtime=False,
+        attr_cache={"ig": cached},
+    )
+
+    moves: list[str] = []
+
+    def _record_to(self: nn.Module, target_device: str):
+        moves.append(target_device)
+        return self
+
+    monkeypatch.setattr(TinyCausalLM, "to", _record_to, raising=False)
+
+    runtime.move_to_device("cuda:0")
+
+    assert runtime.device == "cuda:0"
+    assert primary.device == "cuda:0"
+    assert cached.device == "cuda:0"
+    assert moves == ["cuda:0", "cuda:0"]

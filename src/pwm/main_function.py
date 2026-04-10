@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import gc
+from time import perf_counter
 from typing import Any, Dict, List
 
 import torch
@@ -206,6 +207,38 @@ class ExperimentRuntime:
                 self.attr_cache[attr_name].model = stabilize_model_for_metrics(self.attr_cache[attr_name].model)
         return self.attr_cache[attr_name]
 
+    def move_to_device(self, target_device: str) -> None:
+        normalized_target = str(target_device or "").strip().lower()
+        if not normalized_target or normalized_target == self.device:
+            return
+
+        if normalized_target == "mps":
+            mps_ok = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            if not mps_ok:
+                raise RuntimeError("Requested device 'mps' for LXT, but MPS is not available.")
+        if normalized_target.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"Requested device '{normalized_target}' for LXT, but CUDA is not available.")
+
+        self.hf_model.to(normalized_target)
+        if normalized_target == "mps":
+            self.hf_model = stabilize_model_for_metrics(self.hf_model)
+        self.hf_model.eval()
+        if self.primary_inseq_model is not None:
+            self.primary_inseq_model.model = self.hf_model
+            if hasattr(self.primary_inseq_model, "device"):
+                self.primary_inseq_model.device = normalized_target
+
+        for inseq_model in self.attr_cache.values():
+            if hasattr(inseq_model, "model"):
+                inseq_model.model.to(normalized_target)
+                if normalized_target == "mps":
+                    inseq_model.model = stabilize_model_for_metrics(inseq_model.model)
+                inseq_model.model.eval()
+            if hasattr(inseq_model, "device"):
+                inseq_model.device = normalized_target
+
+        self.device = normalized_target
+
     def close(self) -> None:
         for model in self.attr_cache.values():
             del model
@@ -275,26 +308,53 @@ def run_prompt_experiment(
         attr_name = str(attr_cfg.get("name", ""))
         attr_params = dict(attr_cfg.get("params", {}) or {})
         attr_tag = str(attr_cfg.get("tag") or safe_name(attr_name))
+        attr_device = runtime.device
+        attr_elapsed_ms: float | None = None
+        attr_step_times_ms: List[float] = []
 
         try:
             set_global_seed(_seed_for(base_seed, prompt_idx, attr_idx=attr_idx, stage_offset=11))
+            attr_started = perf_counter()
             if attr_name.lower() == "lxt":
-                raw_attr = get_raw_targets_lxt_v2(
+                requested_lxt_device = str(attr_params.get("device", "")).strip().lower()
+                if requested_lxt_device:
+                    runtime.move_to_device(requested_lxt_device)
+                attr_device = runtime.device
+                raw_attr_result = get_raw_targets_lxt_v2(
                     model=runtime.hf_model,
                     generated_ids=total_ids_cpu,
                     source_len=source_len,
                     attr_params=attr_params,
-                ).raw_target
+                )
+                raw_attr = raw_attr_result.raw_target
+                attr_device = raw_attr_result.device or runtime.device
+                attr_elapsed_ms = raw_attr_result.elapsed_ms
+                attr_step_times_ms = list(raw_attr_result.step_times_ms or [])
+                if attr_elapsed_ms is None:
+                    attr_elapsed_ms = (perf_counter() - attr_started) * 1000.0
+                print(
+                    f"[attr] method={attr_name} prompt={prompt_idx} elapsed_ms={attr_elapsed_ms:.2f} "
+                    f"steps={len(attr_step_times_ms)} device={attr_device}",
+                    flush=True,
+                )
             else:
                 inseq_model = runtime.get_inseq_model(attr_name)
-                raw_attr = get_raw_targets_v2(
+                raw_attr_result = get_raw_targets_v2(
                     inseq_model=inseq_model,
                     prompt=prompt,
                     generated_ids=total_ids_cpu,
                     source_len=source_len,
                     attr_name=attr_name,
                     attr_params=attr_params,
-                ).raw_target
+                )
+                raw_attr = raw_attr_result.raw_target
+                attr_device = runtime.device
+                attr_elapsed_ms = (perf_counter() - attr_started) * 1000.0
+                print(
+                    f"[attr] method={attr_name} prompt={prompt_idx} elapsed_ms={attr_elapsed_ms:.2f} "
+                    f"device={attr_device}",
+                    flush=True,
+                )
         except Exception as exc:
             reason = f"attribution_failed:{exc}"
             for dim_cfg in dimred_methods:
@@ -311,14 +371,22 @@ def run_prompt_experiment(
             dim_params = dict(dim_cfg.get("params", {}) or {})
             dim_tag = str(dim_cfg.get("tag") or safe_name(dim_name))
             combo_key = _make_combo_key(attr_tag, dim_tag)
+            dimred_elapsed_ms: float | None = None
+            metrics_elapsed_ms: float | None = None
+            combo_elapsed_ms: float | None = None
 
             try:
+                combo_started = perf_counter()
+                dimred_started = perf_counter()
                 importance_map = reduce_raw_targets_to_importance(
                     raw_attr,
                     dim_name,
                     dim_params,
                     seed=_seed_for(base_seed, prompt_idx, attr_idx=attr_idx, dim_idx=dim_idx, stage_offset=21),
                 )
+                dimred_elapsed_ms = (perf_counter() - dimred_started) * 1000.0
+
+                metrics_started = perf_counter()
                 metric_result = compute_strict_soft_metrics(
                     runtime.hf_model,
                     total_ids_cpu,
@@ -326,6 +394,14 @@ def run_prompt_experiment(
                     importance_map,
                     seed=_seed_for(base_seed, prompt_idx, attr_idx=attr_idx, dim_idx=dim_idx, stage_offset=31),
                     eps=float(resolved_config.get("metrics", {}).get("eps", 1e-12)),
+                )
+                metrics_elapsed_ms = (perf_counter() - metrics_started) * 1000.0
+                combo_elapsed_ms = (perf_counter() - combo_started) * 1000.0
+                print(
+                    f"[combo] method={attr_name} dimred={dim_name} prompt={prompt_idx} "
+                    f"attr_ms={float(attr_elapsed_ms or 0.0):.2f} dimred_ms={dimred_elapsed_ms:.2f} "
+                    f"metrics_ms={metrics_elapsed_ms:.2f} combo_ms={combo_elapsed_ms:.2f}",
+                    flush=True,
                 )
                 result.combinations[combo_key] = MethodResult(
                     combo_key=combo_key,
@@ -353,6 +429,12 @@ def run_prompt_experiment(
                         for token_id in metric_result.target_token_id
                     ],
                     warnings=metric_result.warnings,
+                    attribution_device=attr_device,
+                    attribution_elapsed_ms=attr_elapsed_ms,
+                    attribution_step_times_ms=list(attr_step_times_ms),
+                    dimred_elapsed_ms=dimred_elapsed_ms,
+                    metrics_elapsed_ms=metrics_elapsed_ms,
+                    combo_elapsed_ms=combo_elapsed_ms,
                 )
             except Exception as exc:
                 result.combinations[combo_key] = _make_skipped_method_result(

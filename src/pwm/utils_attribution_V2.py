@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+from time import perf_counter
 from typing import Any, Dict
 
 import torch
@@ -24,6 +25,9 @@ class RawAttributionResult:
     raw_target: torch.Tensor
     source_ids_debug: torch.Tensor
     target_ids_debug: torch.Tensor
+    device: str | None = None
+    elapsed_ms: float = 0.0
+    step_times_ms: list[float] | None = None
 
 
 def _switch_attr_method_if_supported(inseq_model: Any, method_name: str) -> None:
@@ -31,7 +35,24 @@ def _switch_attr_method_if_supported(inseq_model: Any, method_name: str) -> None
         inseq_model.load_attribution_method(method_name)
 
 
-def _prepare_model_for_lxt(model: Any) -> None:
+def _sync_device(device: str) -> None:
+    device_name = (device or "").lower()
+    if device_name.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        return
+    if device_name == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+        try:
+            torch.mps.synchronize()
+        except Exception:
+            pass
+
+
+def _should_enable_lxt_gradient_checkpointing(attr_params: Dict[str, Any] | None) -> bool:
+    params = dict(attr_params or {})
+    return bool(params.get("enable_gradient_checkpointing", False))
+
+
+def _prepare_model_for_lxt(model: Any, attr_params: Dict[str, Any] | None = None) -> None:
     if getattr(model, "_pwm_lxt_prepared", False):
         return
 
@@ -52,7 +73,13 @@ def _prepare_model_for_lxt(model: Any) -> None:
     for param in model.parameters():
         param.requires_grad = False
 
-    if hasattr(model, "gradient_checkpointing_enable"):
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
+    if _should_enable_lxt_gradient_checkpointing(attr_params) and hasattr(model, "gradient_checkpointing_enable"):
         try:
             model.gradient_checkpointing_enable()
         except Exception:
@@ -145,6 +172,13 @@ def get_raw_targets_v2(
             f"generated_ids must be longer than source_len, got {generated_ids.shape[0]} <= {source_len}"
         )
 
+    model_device = None
+    if hasattr(inseq_model, "model"):
+        try:
+            model_device = str(next(inseq_model.model.parameters()).device)
+        except Exception:
+            model_device = None
+
     _switch_attr_method_if_supported(inseq_model, attr_name)
     generated_text = _decode_generated_text(inseq_model.tokenizer, generated_ids)
 
@@ -178,6 +212,7 @@ def get_raw_targets_v2(
         raw_target=raw_target,
         source_ids_debug=source_ids_debug,
         target_ids_debug=target_ids_debug,
+        device=model_device,
     )
 
 
@@ -191,8 +226,6 @@ def get_raw_targets_lxt_v2(
     Custom LXT raw-target path with the same shape contract as the rest of the
     pipeline: (L_total, T_gen, D).
     """
-    del attr_params  # reserved for future custom LXT options
-
     if generated_ids.ndim != 1:
         raise ValueError(f"generated_ids must be 1D, got shape={tuple(generated_ids.shape)}")
     if int(source_len) <= 0:
@@ -202,35 +235,60 @@ def get_raw_targets_lxt_v2(
             f"generated_ids must be longer than source_len, got {generated_ids.shape[0]} <= {source_len}"
         )
 
-    _prepare_model_for_lxt(model)
+    params = dict(attr_params or {})
+    log_step_times = bool(params.get("log_step_times", True))
+
+    _prepare_model_for_lxt(model, params)
 
     device = next(model.parameters()).device
     ids_cpu = generated_ids.detach().cpu().to(torch.long)
     total_len = int(ids_cpu.shape[0])
     t_gen = total_len - int(source_len)
     emb_dim = int(model.get_input_embeddings().weight.shape[1])
+    embed_layer = model.get_input_embeddings()
+    ids_device = ids_cpu.to(device)
+    full_embeds = embed_layer(ids_device.unsqueeze(0)).detach()
 
     raw_target = torch.full((total_len, t_gen, emb_dim), float("nan"), dtype=torch.float32)
+    step_times_ms: list[float] = []
+    _sync_device(str(device))
+    started = perf_counter()
 
     for step_i in range(t_gen):
         prefix_len = int(source_len) + step_i
-        prefix_ids = ids_cpu[:prefix_len].to(device)
         target_token_id = int(ids_cpu[prefix_len].item())
-
-        if hasattr(model, "zero_grad"):
-            model.zero_grad(set_to_none=True)
-
-        input_embeds = model.get_input_embeddings()(prefix_ids.unsqueeze(0))
-        input_embeds = input_embeds.detach().requires_grad_(True)
+        input_embeds = full_embeds[:, :prefix_len, :].clone().requires_grad_(True)
+        _sync_device(str(device))
+        step_started = perf_counter()
         out = model(inputs_embeds=input_embeds, use_cache=False)
         target_logit = out.logits[0, -1, target_token_id]
-        target_logit.backward()
+        grad = torch.autograd.grad(target_logit, input_embeds, retain_graph=False, create_graph=False)[0]
+        _sync_device(str(device))
+        step_elapsed_ms = (perf_counter() - step_started) * 1000.0
+        step_times_ms.append(step_elapsed_ms)
+        if log_step_times:
+            print(
+                f"[lxt] step={step_i + 1}/{t_gen} prefix_len={prefix_len} "
+                f"elapsed_ms={step_elapsed_ms:.2f} device={device}",
+                flush=True,
+            )
 
-        attr = (input_embeds.grad * input_embeds).detach().cpu().squeeze(0).to(torch.float32)
+        attr = (grad * input_embeds).detach().cpu().squeeze(0).to(torch.float32)
         raw_target[:prefix_len, step_i, :] = attr
+        del out
+        del grad
+        del input_embeds
+
+    _sync_device(str(device))
+    elapsed_ms = (perf_counter() - started) * 1000.0
+    if log_step_times:
+        print(f"[lxt] total_steps={t_gen} elapsed_ms={elapsed_ms:.2f} device={device}", flush=True)
 
     return RawAttributionResult(
         raw_target=raw_target,
         source_ids_debug=ids_cpu[:source_len].clone(),
         target_ids_debug=ids_cpu.clone(),
+        device=str(device),
+        elapsed_ms=elapsed_ms,
+        step_times_ms=step_times_ms,
     )
