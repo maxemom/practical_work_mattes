@@ -23,8 +23,11 @@ from scripts.create_plots import (
     _available_attr_tags,
     _available_dimred_tags,
     _selected_prompt_indices,
+    compute_baseline_comparison_stats,
+    create_all_plots,
     load_run_records,
     plot_baseline_bars,
+    plot_baseline_stat_heatmaps,
     plot_metric_heatmaps,
     plot_token_attribution_rows,
     set_paper_plot_style,
@@ -37,11 +40,18 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _build_run_dir(tmp_path: Path) -> Path:
-    run_dir = tmp_path / "demo_model" / "demo_dataset"
+def _build_run_dir(
+    tmp_path: Path,
+    *,
+    model_slug: str = "demo_model",
+    dataset_slug: str = "demo_dataset",
+    model_name: str = "demo-model",
+    dataset_name: str = "demo-dataset",
+) -> Path:
+    run_dir = tmp_path / model_slug / dataset_slug
     _write_json(
         run_dir / "run_meta.json",
-        {"model_name": "demo-model", "dataset_name": "demo-dataset"},
+        {"model_name": model_name, "dataset_name": dataset_name},
     )
     _write_json(
         run_dir / "attr_index.json",
@@ -62,8 +72,8 @@ def _build_run_dir(tmp_path: Path) -> Path:
         0: {
             "prompt_idx": 0,
             "prompt": "demo prompt zero",
-            "model_name": "demo-model",
-            "dataset_name": "demo-dataset",
+            "model_name": model_name,
+            "dataset_name": dataset_name,
             "generated_text": "demo prompt zero answer",
             "source_ids": [10, 11],
             "total_ids": [10, 11, 12, 13],
@@ -76,8 +86,8 @@ def _build_run_dir(tmp_path: Path) -> Path:
         1: {
             "prompt_idx": 1,
             "prompt": "demo prompt one",
-            "model_name": "demo-model",
-            "dataset_name": "demo-dataset",
+            "model_name": model_name,
+            "dataset_name": dataset_name,
             "generated_text": "demo prompt one answer",
             "source_ids": [20, 21],
             "total_ids": [20, 21, 22, 23],
@@ -342,15 +352,84 @@ def test_available_attr_and_dimred_tags_cover_present_records(tmp_path: Path) ->
     assert _available_dimred_tags(run, summary) == ["baseline", "pca_n_components_1"]
 
 
+def test_compute_baseline_comparison_stats_pairs_against_l2_baseline(tmp_path: Path) -> None:
+    run_dir = _build_run_dir(tmp_path)
+    run = load_run_records(run_dir)
+
+    stats = compute_baseline_comparison_stats(run.records)
+
+    saliency_pca = stats[
+        (stats["attribution_tag"] == "saliency")
+        & (stats["dimred_tag"] == "pca_n_components_1")
+    ].iloc[0]
+    baseline_row = stats[
+        (stats["attribution_tag"] == "saliency")
+        & (stats["dimred_tag"] == "baseline")
+    ].iloc[0]
+
+    assert saliency_pca["paired_prompt_count"] == 2
+    assert saliency_pca["soft_suff_delta_mean"] == pytest.approx(0.0)
+    assert saliency_pca["soft_comp_delta_mean"] == pytest.approx(0.0)
+    assert saliency_pca["soft_suff_nonzero_pairs"] == 2
+    assert saliency_pca["soft_suff_test"] == "paired_sign_test"
+    assert baseline_row["soft_suff_delta_mean"] == pytest.approx(0.0)
+    assert baseline_row["soft_comp_delta_mean"] == pytest.approx(0.0)
+
+
+def test_create_all_plots_respects_grid_model_dataset_selection(tmp_path: Path) -> None:
+    set_paper_plot_style()
+    _build_run_dir(
+        tmp_path / "outputs",
+        model_slug="demo_model",
+        dataset_slug="demo_dataset",
+        model_name="demo-model",
+        dataset_name="demo-dataset",
+    )
+    _build_run_dir(
+        tmp_path / "outputs",
+        model_slug="other_model",
+        dataset_slug="other_dataset",
+        model_name="other-model",
+        dataset_name="other-dataset",
+    )
+
+    grid_path = tmp_path / "grid.yaml"
+    grid_path.write_text(
+        """
+models:
+  - name: demo-model
+datasets:
+  - name: demo-dataset
+""".strip(),
+        encoding="utf-8",
+    )
+
+    report = create_all_plots(
+        output_root=str(tmp_path / "outputs"),
+        plot_dir=str(tmp_path / "plots"),
+        grid_path=str(grid_path),
+        all_bar_dimreds=True,
+        all_token_attributions=True,
+        local_files_only=True,
+    )
+
+    assert report["run_count"] == 1
+    assert report["runs"][0]["run_label"] == "demo-model__demo-dataset"
+    assert (tmp_path / "plots" / "demo-model__demo-dataset").exists()
+    assert not (tmp_path / "plots" / "other-model__other-dataset").exists()
+
+
 def test_create_plots_writes_all_three_plot_types(tmp_path: Path) -> None:
     set_paper_plot_style()
     run_dir = _build_run_dir(tmp_path)
     run = load_run_records(run_dir)
     selected_prompt_indices = _selected_prompt_indices(run.records["prompt_idx"].tolist())
     summary = summarize_records(run.records[run.records["prompt_idx"].isin(selected_prompt_indices)])
+    stats = compute_baseline_comparison_stats(run.records[run.records["prompt_idx"].isin(selected_prompt_indices)])
     plot_dir = tmp_path / "plots"
 
     bars_path = plot_baseline_bars(run, summary, selected_prompt_indices, plot_dir)
+    stat_path = plot_baseline_stat_heatmaps(run, stats, selected_prompt_indices, plot_dir)
     heatmap_path = plot_metric_heatmaps(run, summary, selected_prompt_indices, plot_dir)
     token_path = plot_token_attribution_rows(
         run,
@@ -363,5 +442,6 @@ def test_create_plots_writes_all_three_plot_types(tmp_path: Path) -> None:
     )
 
     assert bars_path is not None and bars_path.exists()
+    assert stat_path is not None and stat_path.exists()
     assert heatmap_path is not None and heatmap_path.exists()
     assert token_path is not None and token_path.exists()

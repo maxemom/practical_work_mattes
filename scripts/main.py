@@ -9,7 +9,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import interpret_outputs
+import create_plots
 import prepare_dataset
 import run_grid
 
@@ -24,11 +24,16 @@ def run_pipeline(
     if not skip_prepare:
         prepare_dataset.run_all_from_config(base_path)
     run_grid.run_grid(base_path=base_path, grid_path=grid_path, max_prompts=max_prompts)
-    interpret_outputs.interpret_outputs("outputs")
+    create_plots.create_all_plots(
+        output_root="outputs",
+        grid_path=grid_path,
+        all_bar_dimreds=True,
+        all_token_attributions=True,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the full experiment pipeline: prepare -> grid -> interpret.")
+    parser = argparse.ArgumentParser(description="Run the full experiment pipeline: prepare -> grid -> create_plots.")
     parser.add_argument("--base", type=str, default="configs/base.yaml")
     parser.add_argument("--grid", type=str, default="configs/grid.yaml")
     parser.add_argument("--max-prompts", type=int, default=None)

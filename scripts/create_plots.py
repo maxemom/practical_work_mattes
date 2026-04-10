@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from pwm.utils_base import load_yaml
 from pwm.utils_pipeline import safe_name
 
 
@@ -430,6 +431,112 @@ def summarize_records(records: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _sign_test_counts(values: Sequence[float], zero_tol: float = 1e-12) -> tuple[int, int, int]:
+    clean = [float(value) for value in values if np.isfinite(value)]
+    positives = sum(1 for value in clean if value > zero_tol)
+    negatives = sum(1 for value in clean if value < -zero_tol)
+    return positives, negatives, positives + negatives
+
+
+def _two_sided_sign_test_pvalue(values: Sequence[float], zero_tol: float = 1e-12) -> float:
+    positives, negatives, trials = _sign_test_counts(values, zero_tol=zero_tol)
+    if trials <= 0:
+        return 1.0
+    tail = min(positives, negatives)
+    cumulative = 0.0
+    denom = 2**trials
+    for successes in range(tail + 1):
+        cumulative += math.comb(trials, successes) / denom
+    return float(min(1.0, 2.0 * cumulative))
+
+
+def _baseline_direction(delta_mean: float, p_value: float, alpha: float) -> str:
+    if not np.isfinite(delta_mean):
+        return "na"
+    if not np.isfinite(p_value) or p_value >= alpha:
+        return "no_clear_difference"
+    if delta_mean > 0.0:
+        return "better"
+    if delta_mean < 0.0:
+        return "worse"
+    return "no_clear_difference"
+
+
+def compute_baseline_comparison_stats(records: pd.DataFrame, *, alpha: float = 0.05) -> pd.DataFrame:
+    if records.empty:
+        return pd.DataFrame()
+
+    usable = records[~records["skipped"]].copy()
+    if usable.empty:
+        return pd.DataFrame()
+
+    metric_specs = [
+        ("soft_ns_mean", "soft_suff"),
+        ("soft_nc_mean", "soft_comp"),
+        ("final_sufficiency_mean", "final_suff"),
+        ("final_comprehensiveness_mean", "final_comp"),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for _, attr_subset in usable.groupby("attribution_tag", sort=False):
+        baseline = attr_subset[attr_subset["dimred_tag"].astype(str) == "baseline"].copy()
+        if baseline.empty:
+            continue
+
+        baseline = (
+            baseline.sort_values("prompt_idx")
+            .drop_duplicates(subset=["prompt_idx"], keep="first")
+            .rename(columns={metric_name: f"{metric_name}_baseline" for metric_name, _ in metric_specs})
+        )
+
+        for _, method_subset in attr_subset.groupby("dimred_tag", sort=False):
+            method_subset = method_subset.sort_values("prompt_idx").drop_duplicates(subset=["prompt_idx"], keep="first")
+            paired = method_subset.merge(
+                baseline[
+                    [
+                        "prompt_idx",
+                        *[f"{metric_name}_baseline" for metric_name, _ in metric_specs],
+                    ]
+                ],
+                on="prompt_idx",
+                how="inner",
+            )
+            if paired.empty:
+                continue
+
+            sample_row = method_subset.iloc[0]
+            row: dict[str, Any] = {
+                "attribution_tag": str(sample_row["attribution_tag"]),
+                "attribution_name": str(sample_row["attribution_name"]),
+                "dimred_tag": str(sample_row["dimred_tag"]),
+                "dimred_name": str(sample_row["dimred_name"]),
+                "paired_prompt_count": int(paired["prompt_idx"].nunique()),
+            }
+
+            for metric_name, prefix in metric_specs:
+                method_values = pd.to_numeric(paired[metric_name], errors="coerce").astype(float)
+                baseline_values = pd.to_numeric(paired[f"{metric_name}_baseline"], errors="coerce").astype(float)
+                deltas = (method_values - baseline_values).to_numpy(dtype=float)
+                positives, negatives, nonzero_count = _sign_test_counts(deltas)
+                p_value = _two_sided_sign_test_pvalue(deltas)
+                delta_mean = float(np.nanmean(deltas)) if deltas.size else float("nan")
+                delta_median = float(np.nanmedian(deltas)) if deltas.size else float("nan")
+                row[f"{prefix}_method_mean"] = float(np.nanmean(method_values.to_numpy(dtype=float)))
+                row[f"{prefix}_baseline_mean"] = float(np.nanmean(baseline_values.to_numpy(dtype=float)))
+                row[f"{prefix}_delta_mean"] = delta_mean
+                row[f"{prefix}_delta_median"] = delta_median
+                row[f"{prefix}_p_value"] = p_value
+                row[f"{prefix}_positive_pairs"] = int(positives)
+                row[f"{prefix}_negative_pairs"] = int(negatives)
+                row[f"{prefix}_nonzero_pairs"] = int(nonzero_count)
+                row[f"{prefix}_direction"] = _baseline_direction(delta_mean, p_value, alpha)
+                row[f"{prefix}_test"] = "paired_sign_test"
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def _dynamic_limits(values: Iterable[float], include_zero: bool = False) -> tuple[float, float]:
     arr = np.asarray([value for value in values if not np.isnan(value)], dtype=float)
     if arr.size == 0:
@@ -498,6 +605,150 @@ def plot_baseline_bars(
     fig.subplots_adjust(top=0.82)
 
     path = out_dir / f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}__{dimred_tag}__bars.png"
+    save_figure(fig, path)
+    return path
+
+
+def _significance_stars(p_value: float) -> str:
+    if not np.isfinite(p_value):
+        return ""
+    if p_value <= 0.001:
+        return "***"
+    if p_value <= 0.01:
+        return "**"
+    if p_value <= 0.05:
+        return "*"
+    return ""
+
+
+def _format_p_value(p_value: float) -> str:
+    if not np.isfinite(p_value):
+        return "NA"
+    if p_value < 0.001:
+        return "<0.001"
+    return f"{p_value:.3f}"
+
+
+def _resolve_diverging_limits(matrix: np.ndarray) -> tuple[float, float]:
+    finite = matrix[np.isfinite(matrix)]
+    if finite.size == 0:
+        return (-1.0, 1.0)
+    max_abs = float(np.max(np.abs(finite)))
+    if math.isclose(max_abs, 0.0):
+        max_abs = 1e-6
+    return (-max_abs, max_abs)
+
+
+def plot_baseline_stat_heatmaps(
+    run: RunRecords,
+    stats_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+    *,
+    alpha: float = 0.05,
+) -> Path | None:
+    if stats_df.empty:
+        return None
+
+    attr_tags = _ordered_attr_tags(run, stats_df)
+    dimred_tags = _ordered_dimred_tags(run, stats_df)
+    attr_labels = {}
+    for tag in attr_tags:
+        matches = stats_df[stats_df["attribution_tag"] == tag]
+        label = matches["attribution_name"].iloc[0] if not matches.empty else run.attr_index.get(tag, {}).get("name", tag)
+        attr_labels[tag] = _pretty_name(str(label))
+
+    dimred_labels = {}
+    for tag in dimred_tags:
+        matches = stats_df[stats_df["dimred_tag"] == tag]
+        dimred_name = matches["dimred_name"].iloc[0] if not matches.empty else run.dimred_index.get(tag, {}).get("name", tag)
+        dimred_labels[tag] = _dimred_display_label(run, tag, str(dimred_name))
+
+    attr_to_y = {tag: idx for idx, tag in enumerate(attr_tags)}
+    dimred_to_x = {tag: idx for idx, tag in enumerate(dimred_tags)}
+    metric_configs = [
+        ("soft_suff", "Soft Suff Delta vs Baseline"),
+        ("soft_comp", "Soft Comp Delta vs Baseline"),
+    ]
+
+    delta_matrices: dict[str, np.ndarray] = {}
+    pvalue_matrices: dict[str, np.ndarray] = {}
+    count_matrices: dict[str, np.ndarray] = {}
+    for prefix, _ in metric_configs:
+        delta_matrices[prefix] = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+        pvalue_matrices[prefix] = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+        count_matrices[prefix] = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+
+    for _, row in stats_df.iterrows():
+        y = attr_to_y[str(row["attribution_tag"])]
+        x = dimred_to_x[str(row["dimred_tag"])]
+        for prefix, _ in metric_configs:
+            delta_matrices[prefix][y, x] = float(row.get(f"{prefix}_delta_mean", float("nan")))
+            pvalue_matrices[prefix][y, x] = float(row.get(f"{prefix}_p_value", float("nan")))
+            count_matrices[prefix][y, x] = float(row.get(f"{prefix}_nonzero_pairs", float("nan")))
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(dimred_tags) * 1.45), max(5.6, len(attr_tags) * 0.76)))
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+
+    for ax, (prefix, title) in zip(axes, metric_configs):
+        mean_matrix = delta_matrices[prefix]
+        p_matrix = pvalue_matrices[prefix]
+        n_matrix = count_matrices[prefix]
+        lower, upper = _resolve_diverging_limits(mean_matrix)
+        norm = mcolors.TwoSlopeNorm(vmin=lower, vcenter=0.0, vmax=upper)
+        im = ax.imshow(mean_matrix, aspect="auto", cmap="RdBu_r", norm=norm)
+        ax.set_xticks(np.arange(len(dimred_tags)))
+        ax.set_xticklabels([dimred_labels[tag] for tag in dimred_tags], rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(attr_tags)))
+        ax.set_yticklabels([attr_labels[tag] for tag in attr_tags])
+        ax.set_title(title)
+
+        ax.set_xticks(np.arange(-0.5, len(dimred_tags), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(attr_tags), 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+        for y in range(mean_matrix.shape[0]):
+            for x in range(mean_matrix.shape[1]):
+                delta_value = mean_matrix[y, x]
+                p_value = p_matrix[y, x]
+                nonzero_pairs = n_matrix[y, x]
+                dimred_tag = dimred_tags[x]
+
+                if dimred_tag == "baseline":
+                    text = "ref\np=1.000"
+                elif not np.isfinite(delta_value):
+                    text = "NA"
+                else:
+                    stars = _significance_stars(p_value)
+                    p_text = _format_p_value(p_value)
+                    n_text = "0" if not np.isfinite(nonzero_pairs) else str(int(nonzero_pairs))
+                    text = f"{delta_value:+.2f}{stars}\np={p_text}\nn={n_text}"
+
+                ax.text(
+                    x,
+                    y,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=7.8,
+                    color=_heatmap_text_color(delta_value, norm),
+                )
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Delta vs baseline")
+
+    fig.suptitle(
+        f"Paired sign test vs L2 baseline | {run.model_name} | {run.dataset_name} | {selection_title} | alpha={alpha:.2f}",
+        y=0.98,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    path = out_dir / (
+        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+        "__baseline_stats_heatmaps.png"
+    )
     save_figure(fig, path)
     return path
 
@@ -817,10 +1068,227 @@ def _filter_run_dirs(run_dirs: Sequence[Path], model_name: str | None, dataset_n
     return filtered
 
 
+def _resolve_path_from_root(path_value: str | None, default_relative: str) -> Path:
+    if path_value:
+        path = Path(path_value)
+        return path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+    return (ROOT / default_relative).resolve()
+
+
+def _run_dirs_from_grid_config(output_root: Path, grid_path: Path) -> list[Path]:
+    grid_cfg = load_yaml(grid_path)
+    models = [str(item.get("name", "")) for item in list(grid_cfg.get("models", []))]
+    datasets = [str(item.get("name", "")) for item in list(grid_cfg.get("datasets", []))]
+    wanted = {
+        (safe_name(model_name), safe_name(dataset_name))
+        for model_name in models
+        for dataset_name in datasets
+        if model_name and dataset_name
+    }
+    if not wanted:
+        return []
+
+    run_dirs = _collect_run_dirs(output_root)
+    return [
+        run_dir
+        for run_dir in run_dirs
+        if (run_dir.parent.name, run_dir.name) in wanted
+    ]
+
+
+def create_all_plots(
+    *,
+    output_root: str = "outputs",
+    plot_dir: str | None = None,
+    grid_path: str | None = None,
+    model_name: str | None = None,
+    dataset_name: str | None = None,
+    prompt_idx: int | None = None,
+    prompt_range: tuple[int, int] | None = None,
+    bar_dimred: str = "baseline",
+    all_bar_dimreds: bool = True,
+    skip_bar_plot: bool = False,
+    skip_stat_plot: bool = False,
+    skip_heatmap_plot: bool = False,
+    skip_token_plot: bool = False,
+    token_attribution: str | None = None,
+    token_dimreds: Sequence[str] | None = None,
+    all_token_attributions: bool = True,
+    token_prompt_idx: int | None = None,
+    token_target_pos: int | None = None,
+    local_files_only: bool = False,
+    suff_vmin: float | None = None,
+    suff_vmax: float | None = None,
+    comp_vmin: float | None = None,
+    comp_vmax: float | None = None,
+    stat_alpha: float = 0.05,
+) -> Dict[str, Any]:
+    set_paper_plot_style()
+
+    resolved_output_root = _resolve_path_from_root(output_root, "outputs")
+    resolved_plot_root = (
+        _resolve_path_from_root(plot_dir, "outputs/plots/create_plots")
+        if plot_dir
+        else resolved_output_root / "plots" / "create_plots"
+    )
+    resolved_plot_root.mkdir(parents=True, exist_ok=True)
+
+    resolved_grid_path = None
+    if grid_path:
+        resolved_grid_path = _resolve_path_from_root(grid_path, grid_path)
+
+    if resolved_grid_path is not None:
+        run_dirs = _run_dirs_from_grid_config(resolved_output_root, resolved_grid_path)
+        run_dirs = _filter_run_dirs(run_dirs, model_name, dataset_name)
+    else:
+        run_dirs = _filter_run_dirs(_collect_run_dirs(resolved_output_root), model_name, dataset_name)
+
+    report: Dict[str, Any] = {
+        "output_root": str(resolved_output_root),
+        "plot_root": str(resolved_plot_root),
+        "grid_path": str(resolved_grid_path) if resolved_grid_path is not None else None,
+        "run_count": 0,
+        "runs": [],
+        "skipped": [],
+    }
+
+    if not run_dirs:
+        print(f"[skip] no runs found below {resolved_output_root}")
+        return report
+
+    token_dimred_queries = [str(item).strip() for item in list(token_dimreds or []) if str(item).strip()] or None
+
+    for run_dir in run_dirs:
+        run = load_run_records(run_dir)
+        if run.records.empty:
+            print(f"[skip] no prompt-level records found in {run_dir}")
+            report["skipped"].append({"run_dir": str(run_dir), "reason": "no_prompt_level_records"})
+            continue
+
+        try:
+            selected_prompt_indices = _selected_prompt_indices(
+                run.records["prompt_idx"].tolist(),
+                prompt_idx=prompt_idx,
+                prompt_range=prompt_range,
+            )
+        except ValueError as exc:
+            print(f"[skip] {run.run_label}: {exc}")
+            report["skipped"].append({"run_dir": str(run_dir), "reason": str(exc)})
+            continue
+
+        filtered_records = run.records[run.records["prompt_idx"].isin(selected_prompt_indices)].copy()
+        summary_df = summarize_records(filtered_records)
+        stats_df = compute_baseline_comparison_stats(filtered_records, alpha=stat_alpha)
+        if summary_df.empty:
+            print(f"[skip] {run.run_label}: no successful records after prompt filtering")
+            report["skipped"].append({"run_dir": str(run_dir), "reason": "no_successful_records_after_prompt_filtering"})
+            continue
+
+        run_plot_dir = resolved_plot_root / run.run_label
+        run_plot_dir.mkdir(parents=True, exist_ok=True)
+        selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
+        summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__summary.csv", index=False)
+        if not stats_df.empty:
+            stats_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__baseline_stats.csv", index=False)
+
+        generated_paths: dict[str, list[str]] = {
+            "bars": [],
+            "stats": [],
+            "heatmaps": [],
+            "tokens": [],
+        }
+
+        if not skip_bar_plot:
+            try:
+                bar_dimred_queries = [bar_dimred]
+                if all_bar_dimreds:
+                    bar_dimred_queries = _available_dimred_tags(run, summary_df)
+                for dimred_query in bar_dimred_queries:
+                    path = plot_baseline_bars(
+                        run=run,
+                        summary_df=summary_df,
+                        selected_prompt_indices=selected_prompt_indices,
+                        out_dir=run_plot_dir,
+                        dimred_query=dimred_query,
+                    )
+                    if path is not None:
+                        generated_paths["bars"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: bar plot failed: {exc}")
+
+        if not skip_stat_plot:
+            try:
+                path = plot_baseline_stat_heatmaps(
+                    run=run,
+                    stats_df=stats_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                    alpha=stat_alpha,
+                )
+                if path is not None:
+                    generated_paths["stats"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: baseline stats plot failed: {exc}")
+
+        if not skip_heatmap_plot:
+            try:
+                path = plot_metric_heatmaps(
+                    run=run,
+                    summary_df=summary_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                    suff_vmin=suff_vmin,
+                    suff_vmax=suff_vmax,
+                    comp_vmin=comp_vmin,
+                    comp_vmax=comp_vmax,
+                )
+                if path is not None:
+                    generated_paths["heatmaps"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
+
+        if not skip_token_plot:
+            try:
+                token_attr_queries = [token_attribution]
+                if all_token_attributions:
+                    token_attr_queries = _available_attr_tags(run, filtered_records)
+                for token_attr_query in token_attr_queries:
+                    path = plot_token_attribution_rows(
+                        run=run,
+                        records=filtered_records,
+                        selected_prompt_indices=selected_prompt_indices,
+                        out_dir=run_plot_dir,
+                        token_prompt_idx=token_prompt_idx,
+                        token_attr_query=token_attr_query,
+                        token_dimred_queries=token_dimred_queries,
+                        token_target_pos=token_target_pos,
+                        local_files_only=local_files_only,
+                    )
+                    if path is not None:
+                        generated_paths["tokens"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: token plot failed: {exc}")
+
+        print(f"[ok] wrote plots to {run_plot_dir}")
+        report["runs"].append(
+            {
+                "run_dir": str(run_dir),
+                "run_label": run.run_label,
+                "plot_dir": str(run_plot_dir),
+                "selected_prompt_indices": list(selected_prompt_indices),
+                "generated_paths": generated_paths,
+            }
+        )
+
+    report["run_count"] = len(report["runs"])
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create comparison plots from normal outputs.")
     parser.add_argument("--output-root", type=str, default="outputs")
     parser.add_argument("--plot-dir", type=str, default=None)
+    parser.add_argument("--grid", type=str, default=None)
     parser.add_argument("--model-name", type=str, default=None)
     parser.add_argument("--dataset-name", type=str, default=None)
     parser.add_argument("--prompt-idx", type=int, default=None, help="Restrict plots to a single prompt.")
@@ -844,8 +1312,10 @@ def main() -> None:
         help="Create one bar comparison for every available dimred variant.",
     )
     parser.add_argument("--skip-bar-plot", action="store_true")
+    parser.add_argument("--skip-stat-plot", action="store_true")
     parser.add_argument("--skip-heatmap-plot", action="store_true")
     parser.add_argument("--skip-token-plot", action="store_true")
+    parser.add_argument("--stat-alpha", type=float, default=0.05)
     parser.add_argument(
         "--token-attribution",
         type=str,
@@ -881,106 +1351,36 @@ def main() -> None:
     parser.add_argument("--comp-vmin", type=float, default=None)
     parser.add_argument("--comp-vmax", type=float, default=None)
     args = parser.parse_args()
-
-    set_paper_plot_style()
-
-    output_root = (ROOT / args.output_root).resolve() if not Path(args.output_root).is_absolute() else Path(args.output_root)
-    plot_root = (
-        (ROOT / args.plot_dir).resolve()
-        if args.plot_dir and not Path(args.plot_dir).is_absolute()
-        else Path(args.plot_dir).resolve() if args.plot_dir
-        else output_root / "plots" / "create_plots"
-    )
-    plot_root.mkdir(parents=True, exist_ok=True)
-
-    run_dirs = _filter_run_dirs(_collect_run_dirs(output_root), args.model_name, args.dataset_name)
-    if not run_dirs:
-        print(f"[skip] no runs found below {output_root}")
-        return
-
     token_dimred_queries = None
     if args.token_dimreds:
         token_dimred_queries = [item.strip() for item in args.token_dimreds.split(",") if item.strip()]
 
-    for run_dir in run_dirs:
-        run = load_run_records(run_dir)
-        if run.records.empty:
-            print(f"[skip] no prompt-level records found in {run_dir}")
-            continue
-
-        try:
-            selected_prompt_indices = _selected_prompt_indices(
-                run.records["prompt_idx"].tolist(),
-                prompt_idx=args.prompt_idx,
-                prompt_range=tuple(args.prompt_range) if args.prompt_range else None,
-            )
-        except ValueError as exc:
-            print(f"[skip] {run.run_label}: {exc}")
-            continue
-
-        filtered_records = run.records[run.records["prompt_idx"].isin(selected_prompt_indices)].copy()
-        summary_df = summarize_records(filtered_records)
-        if summary_df.empty:
-            print(f"[skip] {run.run_label}: no successful records after prompt filtering")
-            continue
-
-        run_plot_dir = plot_root / run.run_label
-        run_plot_dir.mkdir(parents=True, exist_ok=True)
-        selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
-        summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__summary.csv", index=False)
-
-        if not args.skip_bar_plot:
-            try:
-                bar_dimred_queries = [args.bar_dimred]
-                if args.all_bar_dimreds:
-                    bar_dimred_queries = _available_dimred_tags(run, summary_df)
-                for dimred_query in bar_dimred_queries:
-                    plot_baseline_bars(
-                        run=run,
-                        summary_df=summary_df,
-                        selected_prompt_indices=selected_prompt_indices,
-                        out_dir=run_plot_dir,
-                        dimred_query=dimred_query,
-                    )
-            except Exception as exc:
-                print(f"[warn] {run.run_label}: bar plot failed: {exc}")
-
-        if not args.skip_heatmap_plot:
-            try:
-                plot_metric_heatmaps(
-                    run=run,
-                    summary_df=summary_df,
-                    selected_prompt_indices=selected_prompt_indices,
-                    out_dir=run_plot_dir,
-                    suff_vmin=args.suff_vmin,
-                    suff_vmax=args.suff_vmax,
-                    comp_vmin=args.comp_vmin,
-                    comp_vmax=args.comp_vmax,
-                )
-            except Exception as exc:
-                print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
-
-        if not args.skip_token_plot:
-            try:
-                token_attr_queries = [args.token_attribution]
-                if args.all_token_attributions:
-                    token_attr_queries = _available_attr_tags(run, filtered_records)
-                for token_attr_query in token_attr_queries:
-                    plot_token_attribution_rows(
-                        run=run,
-                        records=filtered_records,
-                        selected_prompt_indices=selected_prompt_indices,
-                        out_dir=run_plot_dir,
-                        token_prompt_idx=args.token_prompt_idx,
-                        token_attr_query=token_attr_query,
-                        token_dimred_queries=token_dimred_queries,
-                        token_target_pos=args.token_target_pos,
-                        local_files_only=args.local_files_only,
-                    )
-            except Exception as exc:
-                print(f"[warn] {run.run_label}: token plot failed: {exc}")
-
-        print(f"[ok] wrote plots to {run_plot_dir}")
+    create_all_plots(
+        output_root=args.output_root,
+        plot_dir=args.plot_dir,
+        grid_path=args.grid,
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        prompt_idx=args.prompt_idx,
+        prompt_range=tuple(args.prompt_range) if args.prompt_range else None,
+        bar_dimred=args.bar_dimred,
+        all_bar_dimreds=args.all_bar_dimreds,
+        skip_bar_plot=args.skip_bar_plot,
+        skip_stat_plot=args.skip_stat_plot,
+        skip_heatmap_plot=args.skip_heatmap_plot,
+        skip_token_plot=args.skip_token_plot,
+        token_attribution=args.token_attribution,
+        token_dimreds=token_dimred_queries,
+        all_token_attributions=args.all_token_attributions,
+        token_prompt_idx=args.token_prompt_idx,
+        token_target_pos=args.token_target_pos,
+        local_files_only=args.local_files_only,
+        suff_vmin=args.suff_vmin,
+        suff_vmax=args.suff_vmax,
+        comp_vmin=args.comp_vmin,
+        comp_vmax=args.comp_vmax,
+        stat_alpha=args.stat_alpha,
+    )
 
 
 if __name__ == "__main__":

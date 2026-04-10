@@ -3,17 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-
-@dataclass
-class Run:
-    model: Dict[str, Any]
-    dataset: Dict[str, Any]
-    attribution: Dict[str, Any]
-    dimred: Dict[str, Any]
-    run_id: str
-    resolved: Dict[str, Any]
-
-
 @dataclass
 class MethodResult:
     combo_key: str
