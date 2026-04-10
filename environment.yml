@@ -12,8 +12,10 @@ dependencies:
       - numpy
       - pandas
       - scikit-learn
+      - scipy
       - pyyaml
       - matplotlib
       - pytest
       - pipdeptree
       - python-slugify
+      - git+https://github.com/niggoo/LRP-eXplains-Transformers.git

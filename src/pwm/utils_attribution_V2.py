@@ -6,6 +6,11 @@ from typing import Any, Dict
 
 import torch
 
+from pwm.utils_pipeline import (
+    patch_lxt_attention_interface_compatibility,
+    patch_lxt_transformers_compatibility,
+)
+
 
 @dataclass
 class RawAttributionResult:
@@ -30,12 +35,16 @@ def _prepare_model_for_lxt(model: Any) -> None:
     if getattr(model, "_pwm_lxt_prepared", False):
         return
 
+    patch_lxt_transformers_compatibility()
+
     try:
         from lxt.efficient import monkey_patch
     except ImportError as exc:
         raise ImportError(
-            "Custom LXT attribution requested, but the 'lxt' package is not installed."
+            "Custom LXT attribution requested, but importing 'lxt.efficient' failed "
+            f"with the current dependency stack: {exc}"
         ) from exc
+    patch_lxt_attention_interface_compatibility()
 
     model_module = importlib.import_module(model.__module__)
     monkey_patch(model_module, verbose=False)
@@ -58,6 +67,56 @@ def _decode_generated_text(tokenizer: Any, generated_ids: torch.Tensor) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
+def _canonicalize_raw_target(
+    raw_target: torch.Tensor,
+    source_ids_debug: torch.Tensor,
+    target_ids_debug: torch.Tensor,
+    generated_ids: torch.Tensor,
+    source_len: int,
+) -> torch.Tensor:
+    """
+    Returns canonical shape: (L_total, T_gen, D)
+    """
+    if raw_target.ndim != 3:
+        raise ValueError(f"raw_target must be 3D, got {tuple(raw_target.shape)}")
+
+    generated_ids = generated_ids.detach().cpu().to(torch.long)
+    source_ids_debug = source_ids_debug.detach().cpu().to(torch.long)
+    target_ids_debug = target_ids_debug.detach().cpu().to(torch.long)
+
+    l_total = int(generated_ids.shape[0])
+    l_in = int(source_len)
+    t_gen = l_total - l_in
+    if t_gen <= 0:
+        raise ValueError(f"Expected generated tokens, got L_total={l_total}, L_in={l_in}")
+
+    if raw_target.shape[0] == l_total and raw_target.shape[1] == t_gen:
+        return raw_target.to(torch.float32)
+
+    if raw_target.shape[0] == t_gen and raw_target.shape[1] == l_total:
+        return raw_target.transpose(0, 1).contiguous().to(torch.float32)
+
+    if raw_target.shape[0] == l_total:
+        raw_target = raw_target[l_in:, :, :]
+
+    if raw_target.shape[0] != t_gen:
+        raise ValueError(
+            f"Unexpected raw_target first dim={raw_target.shape[0]}, expected {t_gen} or {l_total}"
+        )
+
+    width = int(raw_target.shape[1])
+    emb_dim = int(raw_target.shape[2])
+    canonical = torch.full((l_total, t_gen, emb_dim), float("nan"), dtype=torch.float32)
+
+    for step_i in range(t_gen):
+        use_len = min(width, l_in + step_i)
+        if use_len <= 0:
+            continue
+        canonical[:use_len, step_i, :] = raw_target[step_i, :use_len, :].to(torch.float32)
+
+    return canonical
+
+
 def get_raw_targets_v2(
     inseq_model: Any,
     prompt: str,
@@ -75,7 +134,7 @@ def get_raw_targets_v2(
     - attribution method + optional hyperparameters
 
     Output:
-    - raw_target in fixed shape (T_gen, L_total, D), no aggregation.
+    - raw_target in fixed shape (L_total, T_gen, D), no aggregation.
     """
     if generated_ids.ndim != 1:
         raise ValueError(f"generated_ids must be 1D, got shape={tuple(generated_ids.shape)}")
@@ -104,6 +163,13 @@ def get_raw_targets_v2(
 
     source_ids_debug = torch.tensor([tok.id for tok in seq.source], dtype=torch.long)
     target_ids_debug = torch.tensor([tok.id for tok in seq.target], dtype=torch.long)
+    raw_target = _canonicalize_raw_target(
+        raw_target=raw_target,
+        source_ids_debug=source_ids_debug,
+        target_ids_debug=target_ids_debug,
+        generated_ids=generated_ids,
+        source_len=source_len,
+    )
 
     del out
     del generated_text

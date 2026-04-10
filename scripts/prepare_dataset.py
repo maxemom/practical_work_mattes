@@ -289,6 +289,36 @@ def get_cfg_path(cfg: Dict, *keys: str) -> str:
     return cur
 
 
+def run_all_from_config(config_path: str = "configs/base.yaml", *, seed: int | None = None, n_samples: int | None = None) -> None:
+    cfg = load_config(Path(config_path))
+    prep_cfg = cfg.get("dataset_preparation", {})
+    resolved_seed = int(seed if seed is not None else prep_cfg.get("seed", cfg.get("seeds", {}).get("seed", 42)))
+    resolved_n = int(n_samples if n_samples is not None else prep_cfg.get("n_samples", 100))
+
+    wikitext_cfg = prep_cfg.get("wikitext", {})
+    prepare_wikitext(
+        input_path=Path(get_cfg_path(cfg, "paths", "raw", "wikitext2_train")),
+        output_path=Path(get_cfg_path(cfg, "paths", "processed", "wikitext2_100")),
+        n_samples=resolved_n,
+        seed=resolved_seed,
+        min_chars=int(wikitext_cfg.get("min_chars", 40)),
+        max_sentence_chars=int(wikitext_cfg.get("max_sentence_chars", 280)),
+        drop_section_titles=bool(wikitext_cfg.get("drop_section_titles", True)),
+    )
+
+    tellmewhy_cfg = prep_cfg.get("tellmewhy", {})
+    prepare_csv(
+        input_path=Path(get_cfg_path(cfg, "paths", "raw", "tellmewhy_csv")),
+        output_path=Path(get_cfg_path(cfg, "paths", "processed", "tellmewhy_100")),
+        n_samples=resolved_n,
+        seed=resolved_seed,
+        narrative_col=str(tellmewhy_cfg.get("narrative_col", "narrative")),
+        question_col=str(tellmewhy_cfg.get("question_col", "question")),
+        min_chars=int(tellmewhy_cfg.get("min_chars", 40)),
+        max_chars=int(tellmewhy_cfg.get("max_chars", 800)),
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Prepare small prompt datasets (1 prompt per line).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -356,32 +386,7 @@ def main() -> None:
         )
 
     elif args.cmd == "all":
-        # WikiText
-        w_in = Path(get_cfg_path(cfg, "paths", "raw", "wikitext2_train"))
-        w_out = Path(get_cfg_path(cfg, "paths", "processed", "wikitext2_100"))
-        prepare_wikitext(
-            input_path=w_in,
-            output_path=w_out,
-            n_samples=args.n_samples,
-            seed=args.seed,
-            min_chars=40,
-            max_sentence_chars=280,
-            drop_section_titles=True,
-        )
-
-        # CSV
-        c_in = Path(get_cfg_path(cfg, "paths", "raw", "tellmewhy_csv"))
-        c_out = Path(get_cfg_path(cfg, "paths", "processed", "tellmewhy_100"))
-        prepare_csv(
-            input_path=c_in,
-            output_path=c_out,
-            n_samples=args.n_samples,
-            seed=args.seed,
-            narrative_col="narrative",
-            question_col="question",
-            min_chars=40,
-            max_chars=800,
-        )
+        run_all_from_config(args.config, seed=args.seed, n_samples=args.n_samples)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 import torch
 import numpy as np
+import warnings
 
 from sklearn.decomposition import FactorAnalysis, FastICA, PCA, NMF, KernelPCA
+from sklearn.exceptions import ConvergenceWarning
 
 
 def _normalize_method_name(method_name: str) -> str:
@@ -26,6 +28,46 @@ def _with_seed_defaults(method_key: str, method_params: dict, seed: int | None) 
         return params
 
     return params
+
+
+def _l2_scalar_fallback(x_valid: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(np.nan_to_num(x_valid, nan=0.0), ord=2, axis=1).astype(np.float32)
+
+
+def _safe_components(requested: int, x_valid: np.ndarray) -> int:
+    n_samples, n_features = x_valid.shape
+    max_components = max(1, min(n_samples, n_features))
+    return max(1, min(int(requested), max_components))
+
+
+def _prepare_reducer(method_key: str, method_params: dict, seed: int | None):
+    params = _with_seed_defaults(method_key, method_params or {}, seed)
+
+    if method_key == "factoranalysis":
+        params.setdefault("max_iter", 1000)
+        params.setdefault("tol", 1e-2)
+        return FactorAnalysis(**params), params
+
+    if method_key == "ica":
+        params.setdefault("max_iter", 1000)
+        params.setdefault("tol", 1e-4)
+        return FastICA(**params), params
+
+    if method_key == "pca":
+        return PCA(**params), params
+
+    if method_key == "kernelpca":
+        return KernelPCA(**params), params
+
+    if method_key == "nmf":
+        params.setdefault("max_iter", 1000)
+        params.setdefault("init", "nndsvda")
+        params.setdefault("tol", 1e-4)
+        return NMF(**params), params
+
+    raise ValueError(
+        f"Unknown method_name. Supported: FactorAnalysis, ICA, PCA, KernelPCA, NMF"
+    )
 
 
 def reduce_raw_target(
@@ -60,7 +102,7 @@ def reduce_raw_target(
         raise ValueError(f"x must have shape (total_len, gen_len, dim), got {tuple(x.shape)}")
 
     method_key = _normalize_method_name(method_name)
-    method_params = _with_seed_defaults(method_key, method_params or {}, seed)
+    method_params = dict(method_params or {})
 
     total_len, gen_len, dim = x.shape
     if dim <= 0:
@@ -99,41 +141,52 @@ def reduce_raw_target(
             continue
 
         x_valid = x_step[valid_mask].numpy()
+        requested_components = int(method_params.get("n_components", 1))
+        safe_components = _safe_components(requested_components, x_valid)
+        step_params = dict(method_params)
+        step_params["n_components"] = safe_components
 
-        if method_key == "factoranalysis":
-            reducer = FactorAnalysis(**method_params)
-            reduced = reducer.fit_transform(x_valid)
+        if n_valid < 2:
+            reduced_scalar_full = np.full((total_len,), np.nan, dtype=np.float32)
+            reduced_scalar_full[valid_mask.numpy()] = _l2_scalar_fallback(x_valid)
+            out[:, step_i] = torch.from_numpy(reduced_scalar_full).to(device=original_device, dtype=original_dtype)
+            continue
 
-        elif method_key == "ica":
-            reducer = FastICA(**method_params)
-            reduced = reducer.fit_transform(x_valid)
+        if method_key in {"factoranalysis", "pca"} and n_valid <= safe_components:
+            reduced_scalar_full = np.full((total_len,), np.nan, dtype=np.float32)
+            reduced_scalar_full[valid_mask.numpy()] = _l2_scalar_fallback(x_valid)
+            out[:, step_i] = torch.from_numpy(reduced_scalar_full).to(device=original_device, dtype=original_dtype)
+            continue
 
-        elif method_key == "pca":
-            reducer = PCA(**method_params)
-            reduced = reducer.fit_transform(x_valid)
+        reducer, _ = _prepare_reducer(method_key, step_params, seed)
 
-        elif method_key == "kernelpca":
-            reducer = KernelPCA(**method_params)
-            reduced = reducer.fit_transform(x_valid)
-
-        elif method_key == "nmf":
-            reducer = NMF(**method_params)
-            reduced = reducer.fit_transform(np.abs(x_valid))
-
-        else:
-            raise ValueError(
-                f"Unknown method_name='{method_name}'. "
-                f"Supported: FactorAnalysis, ICA, PCA, KernelPCA, NMF"
-            )
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                warnings.simplefilter("ignore", category=ConvergenceWarning)
+                if method_key == "nmf":
+                    reduced = reducer.fit_transform(np.abs(x_valid))
+                else:
+                    reduced = reducer.fit_transform(x_valid)
+        except Exception:
+            reduced_scalar_full = np.full((total_len,), np.nan, dtype=np.float32)
+            reduced_scalar_full[valid_mask.numpy()] = _l2_scalar_fallback(x_valid)
+            out[:, step_i] = torch.from_numpy(reduced_scalar_full).to(device=original_device, dtype=original_dtype)
+            continue
 
         if reduced.ndim != 2:
             raise ValueError(f"Reduced output must be 2D, got shape {reduced.shape}")
+
+        reduced = np.nan_to_num(reduced, nan=0.0, posinf=0.0, neginf=0.0)
 
         n_components = reduced.shape[1]
         if n_components > 1:
             reduced_scalar_valid = np.linalg.norm(reduced, ord=2, axis=1)
         else:
             reduced_scalar_valid = np.abs(reduced[:, 0])
+
+        if not np.isfinite(reduced_scalar_valid).all():
+            reduced_scalar_valid = _l2_scalar_fallback(x_valid)
 
         reduced_scalar_full = np.full((total_len,), np.nan, dtype=np.float32)
         reduced_scalar_full[valid_mask.numpy()] = reduced_scalar_valid.astype(np.float32)

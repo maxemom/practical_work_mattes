@@ -1,7 +1,7 @@
 models:
-  - name: Qwen/Qwen3-0.6B
+  - name: Qwen/Qwen2.5-0.5B-Instruct
     params:
-      max_new_tokens: 5
+      max_new_tokens: 10
       do_sample: false
 
 datasets:
@@ -9,7 +9,7 @@ datasets:
     path: data/processed/tellmewhy_5_seed42.txt
 
   - name: wikitext2
-    path: data/processed/wikitest2_5_seed42.txt
+    path: data/processed/wikitext2_5_seed42.txt
 
 attribution_functions:
   - name: saliency
@@ -29,8 +29,15 @@ attribution_functions:
   - name: value_zeroing
     params: {}
 
+  - name: lxt
+    params: {}
+
 
 dimensionality_reduction_methods:
+  - name: baseline
+    params:
+      norm: l2
+
   - name: pca
     params:
       n_components: 1

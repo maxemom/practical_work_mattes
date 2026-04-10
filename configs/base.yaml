@@ -12,10 +12,7 @@ seeds:
 
 runtime:
   device: auto
-
-aggregation:
-  baseline: L2Norm
-  normalize: true
+  dtype: auto
 
 generation:
   max_new_tokens: 10
@@ -24,4 +21,37 @@ generation:
   top_p: 1.0
 
 metrics:
+  mode: log_ratio
+  eps: 1.0e-12
+  random_baseline: softmax_uniform
+  normalize_columns: true
   debug_steps: false
+
+dataset_preparation:
+  seed: 42
+  n_samples: 100
+  wikitext:
+    min_chars: 40
+    max_sentence_chars: 280
+    drop_section_titles: true
+  tellmewhy:
+    narrative_col: narrative
+    question_col: question
+    min_chars: 40
+    max_chars: 800
+
+environment:
+  required_modules:
+    - torch
+    - transformers
+    - inseq
+    - sklearn
+    - scipy
+    - matplotlib
+    - pandas
+    - yaml
+
+docker:
+  expected_files:
+    - docker/Dockerfile
+    - docker/docker-compose.yml

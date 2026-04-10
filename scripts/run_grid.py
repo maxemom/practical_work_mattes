@@ -1,49 +1,26 @@
 from __future__ import annotations
 
 import argparse
-import gc
-import os
-import sys
-import time
-import warnings
 from datetime import datetime, timezone
 from importlib import metadata
+import importlib.util
 from pathlib import Path
-from typing import Any, Dict
+import sys
+from typing import Any, Dict, Iterable, List
 
-import torch
 import yaml
 
-# Ensure local package import works without editable install.
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from pwm.utils_aggregation import aggregate_baseline
-from pwm.utils_base import deep_merge, load_yaml
-from pwm.utils_dimred import aggregate_dimred
-from pwm.utils_pipeline import (
-    append_error,
-    build_attr_index,
-    build_dimred_index,
-    build_error_payload,
-    clear_device_cache,
-    compute_soft_norm_metrics_a4,
-    extract_raw_target_with_alignment,
-    filter_methods,
-    hf_generate_once,
-    importance_stats,
-    load_prompts,
-    raw_target_nan_stats,
-    resolve_device,
-    run_attr,
-    safe_name,
-    set_global_seed,
-    stabilize_model_for_metrics,
-    validate_configs,
-)
-from pwm.utils_results import save_json, save_softnorm_steps_csv
+from pwm.main_function import ExperimentRuntime, run_prompt_experiment
+from pwm.typess import ComboAggregateResult, PromptCombinationRecord, PromptRunResult
+from pwm.utils_base import load_yaml
+from pwm.utils_pipeline import ALLOWED_ATTR_METHODS, ALLOWED_DIMRED_METHODS, build_attr_index, build_dimred_index, configure_runtime_warnings, disable_loading_verbosity, load_prompts, patch_lxt_transformers_compatibility, safe_name
+from pwm.utils_results import save_json
+from pwm.utils_runtime import build_resolved_run_config, resolve_device, resolve_model_dtype
 
 
 def _version_or_na(pkg: str) -> str:
@@ -53,192 +30,317 @@ def _version_or_na(pkg: str) -> str:
         return "n/a"
 
 
-def _configure_loading_verbosity(show_loading: bool) -> None:
-    if show_loading:
-        return
+def _check_python_module(module_name: str) -> tuple[bool, str]:
+    found = importlib.util.find_spec(module_name) is not None
+    return found, "available" if found else "missing"
 
-    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+def check_environment(base_cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    modules = list(base_cfg.get("environment", {}).get("required_modules", []))
+    reports: List[Dict[str, str]] = []
+    if not modules:
+        return reports
+
+    print("=== Environment Check ===")
+    for module_name in modules:
+        ok, reason = _check_python_module(str(module_name))
+        status = "OK" if ok else "MISSING"
+        print(f"[env] {module_name}: {status} ({reason})")
+        reports.append({"module": str(module_name), "status": status, "reason": reason})
+    return reports
+
+
+def _check_docker_files(base_cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    reports: List[Dict[str, str]] = []
+    docker_cfg = base_cfg.get("docker", {})
+    expected = list(docker_cfg.get("expected_files", []))
+    if not expected:
+        return reports
+
+    print("=== Docker Check ===")
+    for rel_path in expected:
+        path = ROOT / rel_path
+        ok = path.exists()
+        status = "OK" if ok else "MISSING"
+        print(f"[docker] {rel_path}: {status}")
+        reports.append({"path": rel_path, "status": status})
+    return reports
+
+
+def _check_model_support(model_cfg: Dict[str, Any]) -> tuple[bool, str]:
+    model_name = str(model_cfg.get("name", ""))
     try:
-        from transformers.utils import logging as hf_logging
+        from transformers import AutoConfig
 
-        hf_logging.set_verbosity_error()
-        hf_logging.disable_progress_bar()
-    except Exception:
-        pass
+        AutoConfig.from_pretrained(model_name)
+        return True, "config_resolved"
+    except Exception as exc:
+        return False, str(exc)
 
+
+def _check_dataset_support(dataset_cfg: Dict[str, Any], max_prompts: int | None = None) -> tuple[bool, str, List[str]]:
     try:
-        from huggingface_hub.utils import disable_progress_bars
-
-        disable_progress_bars()
-    except Exception:
-        pass
-
-
-def _ts_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+        prompts = load_prompts(dataset_cfg, max_prompts)
+    except Exception as exc:
+        return False, str(exc), []
+    return True, f"{len(prompts)} prompts", prompts
 
 
-def _log_stage_start(prompt_idx: int, stage: str, extra: str = "") -> float:
-    msg = f"[time] {_ts_now()} | prompt_{prompt_idx:03d} | {stage} START"
-    if extra:
-        msg += f" | {extra}"
-    print(msg, flush=True)
-    return time.perf_counter()
+def _check_attr_support(attr_cfg: Dict[str, Any]) -> tuple[bool, str]:
+    name = str(attr_cfg.get("name", "")).lower()
+    if name not in ALLOWED_ATTR_METHODS:
+        return False, "not in allowed attribution set"
+    if name == "lxt":
+        ok, reason = _check_python_module("lxt")
+        if not ok:
+            return False, "missing python module 'lxt' (install LRP-eXplains-Transformers)"
+        sub_ok, _ = _check_python_module("lxt.efficient")
+        if not sub_ok:
+            return False, "missing submodule 'lxt.efficient' (install LRP-eXplains-Transformers)"
+        try:
+            patch_lxt_transformers_compatibility()
+            from lxt.efficient import monkey_patch
+
+            del monkey_patch
+        except Exception as exc:
+            return False, f"lxt import failed after compatibility shims: {exc}"
+    return True, "supported"
 
 
-def _log_stage_end(prompt_idx: int, stage: str, t0: float, extra: str = "") -> None:
-    elapsed_s = time.perf_counter() - t0
-    msg = f"[time] {_ts_now()} | prompt_{prompt_idx:03d} | {stage} END | elapsed_s={elapsed_s:.3f}"
-    if extra:
-        msg += f" | {extra}"
-    print(msg, flush=True)
+def _check_dimred_support(dimred_cfg: Dict[str, Any]) -> tuple[bool, str]:
+    name = str(dimred_cfg.get("name", "")).lower()
+    if name not in ALLOWED_DIMRED_METHODS:
+        return False, "not in allowed dimred set"
+    return True, "supported"
 
 
-def _is_mps_dtype_mm_error(exc: Exception) -> bool:
-    msg = str(exc)
-    return (
-        "MPSNDArrayMatrixMultiplication" in msg
-        or "cannot have different datatype" in msg
-        or "Destination NDArray and Accumulator NDArray cannot have different datatype" in msg
+def _attach_tags(index: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tagged: List[Dict[str, Any]] = []
+    for tag, meta in index.items():
+        tagged.append(
+            {
+                "tag": tag,
+                "name": meta["name"],
+                "params": dict(meta.get("params", {}) or {}),
+                "index": int(meta.get("index", 0)),
+            }
+        )
+    return tagged
+
+
+def build_combo_aggregates(
+    model_name: str,
+    dataset_name: str,
+    run_meta: Dict[str, Any],
+    attrs: Iterable[Dict[str, Any]],
+    dimreds: Iterable[Dict[str, Any]],
+) -> Dict[str, ComboAggregateResult]:
+    aggregates: Dict[str, ComboAggregateResult] = {}
+    for attr_cfg in attrs:
+        for dim_cfg in dimreds:
+            combo_key = f"{attr_cfg['tag']}__{dim_cfg['tag']}"
+            aggregates[combo_key] = ComboAggregateResult(
+                combo_key=combo_key,
+                model_name=model_name,
+                dataset_name=dataset_name,
+                attribution_tag=str(attr_cfg["tag"]),
+                attribution_name=str(attr_cfg["name"]),
+                attribution_params=dict(attr_cfg.get("params", {}) or {}),
+                dimred_tag=str(dim_cfg["tag"]),
+                dimred_name=str(dim_cfg["name"]),
+                dimred_params=dict(dim_cfg.get("params", {}) or {}),
+                run_meta=dict(run_meta),
+            )
+    return aggregates
+
+
+def append_prompt_result(
+    aggregates: Dict[str, ComboAggregateResult],
+    prompt_result: PromptRunResult,
+) -> None:
+    for combo_key, method_result in prompt_result.combinations.items():
+        if combo_key not in aggregates:
+            continue
+        aggregates[combo_key].prompts.append(
+            PromptCombinationRecord(
+                prompt_idx=prompt_result.prompt_idx,
+                prompt=prompt_result.prompt,
+                generated_text=prompt_result.generated_text,
+                source_ids=list(prompt_result.source_ids),
+                total_ids=list(prompt_result.total_ids),
+                generated_token_ids=list(prompt_result.generated_token_ids),
+                source_len=prompt_result.source_len,
+                total_len=prompt_result.total_len,
+                generated_tokens=list(prompt_result.generated_tokens),
+                method_result=method_result,
+            )
+        )
+
+
+def summarize_aggregate(aggregate: ComboAggregateResult) -> Dict[str, Any]:
+    valid = [entry.method_result for entry in aggregate.prompts if not entry.method_result.skipped]
+    skipped = [entry.method_result for entry in aggregate.prompts if entry.method_result.skipped]
+
+    def _mean(values: List[float]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    warnings = sorted(
+        {
+            warning
+            for entry in aggregate.prompts
+            for warning in entry.method_result.warnings
+        }
     )
 
+    summary = {
+        "prompt_count": len(aggregate.prompts),
+        "successful_prompt_count": len(valid),
+        "skipped_prompt_count": len(skipped),
+        "soft_ns_mean": _mean([item.soft_ns_mean for item in valid]),
+        "soft_nc_mean": _mean([item.soft_nc_mean for item in valid]),
+        "final_sufficiency_mean": _mean([item.final_sufficiency_mean for item in valid]),
+        "final_comprehensiveness_mean": _mean([item.final_comprehensiveness_mean for item in valid]),
+        "skip_reasons": sorted({item.skip_reason for item in skipped if item.skip_reason}),
+        "warnings": warnings,
+    }
+    aggregate.summary = summary
+    aggregate.warnings = warnings
+    return summary
 
-def _needs_mps_fp32_for_attr(attr_name: str) -> bool:
-    # Methods using captum internals / sampling are more likely to trigger
-    # mixed-dtype matmul assertions on MPS.
-    return (attr_name or "").lower() in {
-        "gradient_shap",
-        "deeplift",
-        "integrated_gradients",
+
+def _save_aggregate_file(run_dir: Path, aggregate: ComboAggregateResult) -> None:
+    summarize_aggregate(aggregate)
+    save_json(run_dir / f"{aggregate.combo_key}.json", aggregate)
+
+
+def save_all_aggregates(run_dir: Path, aggregates: Dict[str, ComboAggregateResult]) -> None:
+    for aggregate in aggregates.values():
+        _save_aggregate_file(run_dir, aggregate)
+
+
+def _prompt_dir(run_dir: Path, prompt_idx: int) -> Path:
+    return run_dir / "prompts" / f"prompt_{prompt_idx:03d}"
+
+
+def _build_prompt_payload(prompt_result: PromptRunResult) -> Dict[str, Any]:
+    return {
+        "prompt_idx": int(prompt_result.prompt_idx),
+        "prompt": prompt_result.prompt,
+        "model_name": prompt_result.model_name,
+        "dataset_name": prompt_result.dataset_name,
+        "generated_text": prompt_result.generated_text,
+        "source_ids": list(prompt_result.source_ids),
+        "total_ids": list(prompt_result.total_ids),
+        "generated_token_ids": list(prompt_result.generated_token_ids),
+        "generated_tokens": list(prompt_result.generated_tokens),
+        "source_len": int(prompt_result.source_len),
+        "total_len": int(prompt_result.total_len),
+        "warnings": list(prompt_result.warnings),
     }
 
 
-def _prepare_attr_params_for_device(
-    attr_name: str,
-    attr_params: Dict[str, Any],
-    device: str,
+def _combo_result_file_name(method_result: Any) -> str:
+    if str(method_result.dimred_tag) == "baseline":
+        return f"{method_result.attribution_tag}_baseline.json"
+    return f"{method_result.attribution_tag}_dimred_{method_result.dimred_tag}.json"
+
+
+def save_prompt_outputs(run_dir: Path, prompt_result: PromptRunResult) -> None:
+    prompt_dir = _prompt_dir(run_dir, prompt_result.prompt_idx)
+    save_json(prompt_dir / "prompt.json", _build_prompt_payload(prompt_result))
+    for method_result in prompt_result.combinations.values():
+        save_json(prompt_dir / _combo_result_file_name(method_result), method_result)
+
+
+def _print_support(kind: str, name: str, ok: bool, reason: str) -> None:
+    status = "OK" if ok else "SKIP"
+    print(f"[support] {kind}={name}: {status} ({reason})")
+
+
+def run_grid(
+    *,
+    base_path: str = "configs/base.yaml",
+    grid_path: str = "configs/grid.yaml",
+    max_prompts: int | None = None,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
-    params = dict(attr_params or {})
-    name = (attr_name or "").lower()
-    if device == "mps" and name == "gradient_shap":
-        n_samples = int(params.get("n_samples", 24))
-        if n_samples > 8:
-            params["n_samples"] = 8
-            print(
-                f"[warn] gradient_shap on MPS: reducing n_samples {n_samples} -> 8 to avoid OOM/system slowdown.",
-                flush=True,
-            )
-    return params
+    disable_loading_verbosity()
+    configure_runtime_warnings()
+    base_cfg = load_yaml(Path(base_path))
+    grid_cfg = load_yaml(Path(grid_path))
 
+    env_reports = check_environment(base_cfg)
+    docker_reports = _check_docker_files(base_cfg)
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base", type=str, default="configs/base.yaml")
-    parser.add_argument("--grid", type=str, default="configs/grid.yaml")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--max-prompts", type=int, default=None)
-    parser.add_argument("--only-attr", type=str, default=None)
-    parser.add_argument("--only-dimred", type=str, default=None)
-    parser.add_argument("--only-prompt-idx", type=int, default=None)
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Optional runtime device override (e.g., auto|cpu|mps|cuda|cuda:0).",
-    )
-    parser.add_argument(
-        "--show-loading",
-        action="store_true",
-        help="Show model/tokenizer loading progress bars and logs.",
-    )
-    args = parser.parse_args()
-
-    _configure_loading_verbosity(show_loading=args.show_loading)
-    warnings.filterwarnings(
-        "ignore",
-        message="Setting forward, backward hooks and attributes on non-linear",
-        category=UserWarning,
+    requested_device = str(base_cfg.get("runtime", {}).get("device", "auto"))
+    device_report = resolve_device(requested_device)
+    print(
+        f"[runtime] requested_device={requested_device} chosen_device={device_report.chosen} "
+        f"cuda={device_report.cuda_available} mps={device_report.mps_available}"
     )
 
-    base_cfg = load_yaml(Path(args.base))
-    grid_cfg = load_yaml(Path(args.grid))
-    validate_configs(base_cfg, grid_cfg)
+    attr_index = build_attr_index(grid_cfg.get("attribution_functions", []))
+    dimred_index = build_dimred_index(grid_cfg.get("dimensionality_reduction_methods", []))
+    tagged_attrs = _attach_tags(attr_index)
+    tagged_dimreds = _attach_tags(dimred_index)
 
-    attrs = filter_methods(grid_cfg["attribution_functions"], args.only_attr)
-    dimreds = filter_methods(grid_cfg["dimensionality_reduction_methods"], args.only_dimred)
-    if not attrs:
-        raise ValueError("No attribution methods left after filtering (--only-attr).")
-    if not dimreds:
-        raise ValueError("No dimred methods left after filtering (--only-dimred).")
+    valid_attrs: List[Dict[str, Any]] = []
+    valid_dimreds: List[Dict[str, Any]] = []
 
-    output_root = Path(base_cfg["paths"]["output_dir"])
+    for attr_cfg in tagged_attrs:
+        ok, reason = _check_attr_support(attr_cfg)
+        _print_support("attribution", str(attr_cfg["name"]), ok, reason)
+        if ok:
+            valid_attrs.append(attr_cfg)
+
+    for dim_cfg in tagged_dimreds:
+        ok, reason = _check_dimred_support(dim_cfg)
+        _print_support("dimred", str(dim_cfg["name"]), ok, reason)
+        if ok:
+            valid_dimreds.append(dim_cfg)
+
+    output_root = ROOT / str(base_cfg.get("paths", {}).get("output_dir", "outputs"))
     output_root.mkdir(parents=True, exist_ok=True)
-    base_seed = int(base_cfg.get("seeds", {}).get("seed", 42))
-    metric_stride = int(base_cfg.get("metrics", {}).get("metric_stride", 1))
-    debug_metric_steps = bool(base_cfg.get("metrics", {}).get("debug_steps", False))
 
-    requested_device = args.device if args.device is not None else str(base_cfg.get("runtime", {}).get("device", "auto"))
-    chosen_device = resolve_device(requested_device)
-    base_cfg.setdefault("runtime", {})
-    base_cfg["runtime"]["device"] = chosen_device
+    run_report: Dict[str, Any] = {
+        "environment": env_reports,
+        "docker": docker_reports,
+        "runs": [],
+    }
 
-    print("=== Resolved Startup Config ===")
-    print(f"base_seed={base_seed} | metric_stride={metric_stride} | device={chosen_device}")
-    print(f"attribution_methods={[a.get('name') for a in attrs]}")
-    print(f"dimred_methods={[d.get('name') for d in dimreds]}")
+    for model_cfg in grid_cfg.get("models", []):
+        model_ok, model_reason = _check_model_support(model_cfg)
+        _print_support("model", str(model_cfg.get("name", "")), model_ok, model_reason)
+        if not model_ok:
+            continue
 
-    models = grid_cfg["models"]
-    datasets = grid_cfg["datasets"]
-    total_runs = len(models) * len(datasets)
-    print(f"Planned outer runs (model,dataset): {total_runs}")
+        for dataset_cfg in grid_cfg.get("datasets", []):
+            dataset_ok, dataset_reason, prompts = _check_dataset_support(dataset_cfg, max_prompts=max_prompts)
+            _print_support("dataset", str(dataset_cfg.get("name", "")), dataset_ok, dataset_reason)
+            if not dataset_ok or not valid_attrs or not valid_dimreds:
+                continue
 
-    if args.dry_run:
-        return
+            model_name = str(model_cfg["name"])
+            dataset_name = str(dataset_cfg["name"])
+            resolved = build_resolved_run_config(
+                base_cfg=base_cfg,
+                model_cfg=model_cfg,
+                dataset_cfg=dataset_cfg,
+                attrs=valid_attrs,
+                dimreds=valid_dimreds,
+                chosen_device=device_report.chosen,
+            )
+            _, model_dtype_name = resolve_model_dtype(resolved)
 
-    import inseq
-    from transformers import AutoConfig
-
-    for m in models:
-        mn = m.get("name")
-        try:
-            AutoConfig.from_pretrained(mn)
-        except Exception as e:
-            raise RuntimeError(f"Model config not loadable for '{mn}': {e}") from e
-    for d in datasets:
-        ds_prompts = load_prompts(d, args.max_prompts)
-        if not ds_prompts:
-            raise RuntimeError(f"Dataset '{d.get('name', 'unknown')}' produced zero prompts")
-
-    run_i = 0
-    for model_cfg in models:
-        for dataset_cfg in datasets:
-            run_i += 1
-            model_name = model_cfg["name"]
-            dataset_name = dataset_cfg["name"]
             model_slug = safe_name(model_name)
             dataset_slug = safe_name(dataset_name)
             run_dir = output_root / model_slug / dataset_slug
             run_dir.mkdir(parents=True, exist_ok=True)
-            prompts_root = run_dir / "prompts"
-            prompts_root.mkdir(parents=True, exist_ok=True)
 
-            resolved = deep_merge(
-                base_cfg,
-                {
-                    "model": model_cfg,
-                    "dataset": dataset_cfg,
-                    "attribution_functions": attrs,
-                    "dimensionality_reduction_methods": dimreds,
-                },
-            )
-            with (run_dir / "resolved_config.yaml").open("w", encoding="utf-8") as f:
-                yaml.safe_dump(resolved, f, sort_keys=False, allow_unicode=True)
-
-            attr_index = build_attr_index(attrs)
-            dimred_index = build_dimred_index(dimreds)
+            with (run_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(resolved, handle, sort_keys=False, allow_unicode=True)
             save_json(run_dir / "attr_index.json", attr_index)
             save_json(run_dir / "dimred_index.json", dimred_index)
 
@@ -248,277 +350,69 @@ def main() -> None:
                 "torch": _version_or_na("torch"),
                 "transformers": _version_or_na("transformers"),
                 "inseq": _version_or_na("inseq"),
-                "requested_device": requested_device,
-                "device": chosen_device,
+                "scipy": _version_or_na("scipy"),
                 "model_name": model_name,
                 "dataset_name": dataset_name,
+                "requested_device": requested_device,
+                "device": device_report.chosen,
+                "model_dtype": model_dtype_name,
             }
             save_json(run_dir / "run_meta.json", run_meta)
 
-            print(f"[{run_i}/{total_runs}] model={model_name} dataset={dataset_name}")
-            prompts = load_prompts(dataset_cfg, args.max_prompts)
-            if args.only_prompt_idx is not None:
-                if args.only_prompt_idx < 0 or args.only_prompt_idx >= len(prompts):
-                    raise IndexError(f"--only-prompt-idx {args.only_prompt_idx} out of range [0,{len(prompts)-1}]")
-                prompts = [prompts[args.only_prompt_idx]]
-                prompt_start_idx = args.only_prompt_idx
-            else:
-                prompt_start_idx = 0
+            print(f"[run] model={model_name} dataset={dataset_name} prompts={len(prompts)} dtype={model_dtype_name}")
 
-            first_attr_name = attrs[0]["name"]
-            inseq_model = inseq.load_model(
-                model_name,
-                attribution_method=first_attr_name,
-                device=chosen_device,
-            )
-            hf_model = inseq_model.model
-            tokenizer = inseq_model.tokenizer
+            if dry_run:
+                continue
 
-            # Compat: if runtime switching is unavailable, avoid preloading all
-            # attribution models at once (high memory pressure on MPS).
-            can_switch_runtime = hasattr(inseq_model, "load_attribution_method")
-            if not can_switch_runtime and len(attrs) > 1:
-                print("[warn] inseq model has no load_attribution_method; loading one attribution model at a time.")
-
-            for local_i, prompt in enumerate(prompts):
-                prompt_idx = prompt_start_idx + local_i
-                prompt_dir = prompts_root / f"prompt_{prompt_idx:03d}"
-                prompt_dir.mkdir(parents=True, exist_ok=True)
-
-                debug_payload: Dict[str, Any] = {
-                    "prompt_idx": prompt_idx,
-                    "prompt": prompt,
-                    "attr_tags": list(attr_index.keys()),
-                    "dimred_tags": list(dimred_index.keys()),
-                }
-                save_json(prompt_dir / "debug.json", debug_payload)
-
-                try:
-                    t_gen_stage = _log_stage_start(prompt_idx, "generation")
-                    seed_gen = base_seed + 10_000 * prompt_idx
-                    set_global_seed(seed_gen)
-                    src_ids, gen_ids, full_text = hf_generate_once(
-                        model=hf_model,
-                        tokenizer=tokenizer,
+            runtime = ExperimentRuntime.create(model_name, resolved, valid_attrs)
+            try:
+                for prompt_idx, prompt in enumerate(prompts):
+                    print(f"[prompt] idx={prompt_idx} text_len={len(prompt)}")
+                    prompt_result = run_prompt_experiment(
                         prompt=prompt,
-                        generation_cfg=resolved.get("generation", {}),
+                        model_name=model_name,
+                        resolved_config=resolved,
+                        attribution_methods=valid_attrs,
+                        dimred_methods=valid_dimreds,
+                        prompt_idx=prompt_idx,
+                        dataset_name=dataset_name,
+                        runtime=runtime,
                     )
-                    source_len = int(src_ids.shape[0])
-                    full_len = int(gen_ids.shape[0])
-                    t_gen = full_len - source_len
-                    if t_gen <= 0:
-                        print(f"[warn] prompt_{prompt_idx:03d}: no generation (L_total={full_len}, L_in={source_len}), skip.")
-                        debug_payload.update(
-                            {
-                                "seed_gen": seed_gen,
-                                "source_len": source_len,
-                                "full_len": full_len,
-                                "T_gen": t_gen,
-                                "source_text": prompt,
-                                "full_text": full_text,
-                                "generated_ids": gen_ids.tolist(),
-                                "skipped_reason": "no_generated_tokens",
-                            }
-                        )
-                        save_json(prompt_dir / "debug.json", debug_payload)
-                        _log_stage_end(prompt_idx, "generation", t_gen_stage, "skipped:no_generated_tokens")
-                        continue
-
-                    debug_payload.update(
-                        {
-                            "seed_gen": seed_gen,
-                            "source_len": source_len,
-                            "full_len": full_len,
-                            "T_gen": t_gen,
-                            "source_text": prompt,
-                            "full_text": full_text,
-                            "generated_ids": gen_ids.tolist(),
-                            "source_ids": src_ids.tolist(),
-                            "attr_debug": {},
-                        }
+                    save_prompt_outputs(run_dir, prompt_result)
+                    print(
+                        f"[save] prompt={prompt_idx} combo_jsons_saved={len(prompt_result.combinations)} dir={_prompt_dir(run_dir, prompt_idx)}",
+                        flush=True,
                     )
-                    save_json(prompt_dir / "debug.json", debug_payload)
-                    _log_stage_end(
-                        prompt_idx,
-                        "generation",
-                        t_gen_stage,
-                        f"source_len={source_len} full_len={full_len} T_gen={t_gen}",
-                    )
-                except Exception as e:
-                    _log_stage_end(prompt_idx, "generation", t_gen_stage, "failed")
-                    append_error(prompt_dir, build_error_payload("generation", prompt_idx, e))
-                    continue
+            finally:
+                runtime.close()
 
-                for a_tag, a_cfg in attr_index.items():
-                    t_attr_stage = None
-                    try:
-                        attr_name = a_cfg["name"]
-                        t_attr_stage = _log_stage_start(prompt_idx, "attribution", f"attr_tag={a_tag} method={attr_name}")
-                        attr_params = _prepare_attr_params_for_device(attr_name, a_cfg["params"], chosen_device)
-                        seed_attr = base_seed + 100_000 * prompt_idx + 1_000 * int(a_cfg["index"])
-                        set_global_seed(seed_attr)
+            run_report["runs"].append(
+                {
+                    "model_name": model_name,
+                    "dataset_name": dataset_name,
+                    "output_dir": str(run_dir),
+                    "combination_count": len(valid_attrs) * len(valid_dimreds),
+                    "prompt_count": len(prompts),
+                }
+            )
 
-                        if can_switch_runtime or attr_name == first_attr_name:
-                            model_for_attr = inseq_model
-                            temp_model_loaded = False
-                        else:
-                            model_for_attr = inseq.load_model(
-                                model_name,
-                                attribution_method=attr_name,
-                                device=chosen_device,
-                            )
-                            temp_model_loaded = True
+    return run_report
 
-                        # Hard MPS safety guard for methods that can crash at native level
-                        # before Python can catch exceptions.
-                        if chosen_device == "mps" and _needs_mps_fp32_for_attr(attr_name):
-                            model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
 
-                        try:
-                            out = run_attr(
-                                inseq_model=model_for_attr,
-                                prompt=prompt,
-                                full_text=full_text,
-                                method_name=attr_name,
-                                attr_params=attr_params,
-                            )
-                        except Exception as e:
-                            if chosen_device == "mps" and _is_mps_dtype_mm_error(e):
-                                print(
-                                    f"[warn] prompt_{prompt_idx:03d} {a_tag}: MPS dtype mismatch during attribution; retrying in float32.",
-                                    flush=True,
-                                )
-                                model_for_attr.model = stabilize_model_for_metrics(model_for_attr.model)
-                                out = run_attr(
-                                    inseq_model=model_for_attr,
-                                    prompt=prompt,
-                                    full_text=full_text,
-                                    method_name=attr_name,
-                                    attr_params=attr_params,
-                                )
-                            else:
-                                raise
-                        raw_target = extract_raw_target_with_alignment(
-                            out=out,
-                            source_ids=src_ids,
-                            generated_ids=gen_ids,
-                        )
-                        del out
-                        if temp_model_loaded:
-                            del model_for_attr
-                            gc.collect()
-                            clear_device_cache(chosen_device)
-                        _log_stage_end(prompt_idx, "attribution", t_attr_stage, f"attr_tag={a_tag}")
-                        nan_stats = raw_target_nan_stats(raw_target, source_len=source_len)
-                        nan_ratio = nan_stats["global_nan_ratio"]
-                        active_nan_ratio = nan_stats["active_nan_ratio"]
-                        if active_nan_ratio > 0.05:
-                            print(
-                                f"[warn] prompt_{prompt_idx:03d} {a_tag}: active_nan_ratio={active_nan_ratio:.4f} > 0.05 "
-                                f"(global_nan_ratio={nan_ratio:.4f})"
-                            )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the prompt -> attribution -> dimred -> metrics experiment grid.")
+    parser.add_argument("--base", type=str, default="configs/base.yaml")
+    parser.add_argument("--grid", type=str, default="configs/grid.yaml")
+    parser.add_argument("--max-prompts", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
 
-                        baseline_target = aggregate_baseline(raw_target=raw_target, resolved=resolved)
-                        baseline_stats = importance_stats(baseline_target)
-                        if prompt_idx == prompt_start_idx:
-                            print(f"[stats] prompt_{prompt_idx:03d} {a_tag} baseline={baseline_stats}")
-
-                        hf_model = stabilize_model_for_metrics(hf_model)
-                        t_base_metrics = _log_stage_start(prompt_idx, "metrics_baseline", f"attr_tag={a_tag}")
-                        baseline_res = compute_soft_norm_metrics_a4(
-                            model=hf_model,
-                            source_ids=src_ids,
-                            generated_ids=gen_ids,
-                            importance_map=baseline_target,
-                            metric_stride=metric_stride,
-                            debug_steps=debug_metric_steps,
-                        )
-                        save_json(prompt_dir / f"{a_tag}_baseline.json", baseline_res)
-                        save_softnorm_steps_csv(prompt_dir / f"{a_tag}_baseline_steps.csv", baseline_res)
-                        _log_stage_end(prompt_idx, "metrics_baseline", t_base_metrics, f"attr_tag={a_tag}")
-
-                        debug_payload["attr_debug"][a_tag] = {
-                            "seed_attr": seed_attr,
-                            "raw_target_shape": list(raw_target.shape),
-                            "nan_ratio": nan_ratio,
-                            "active_nan_ratio": active_nan_ratio,
-                            "baseline_stats": baseline_stats,
-                            "baseline_warnings": baseline_res.get("warnings", []),
-                        }
-                        save_json(prompt_dir / "debug.json", debug_payload)
-
-                        for d_tag, d_cfg in dimred_index.items():
-                            try:
-                                t_dim_metrics = _log_stage_start(
-                                    prompt_idx,
-                                    "metrics_dimred",
-                                    f"attr_tag={a_tag} dimred_tag={d_tag}",
-                                )
-                                dim_cfg = {"name": d_cfg["name"], "params": d_cfg["params"]}
-                                dim_target = aggregate_dimred(raw_target=raw_target, resolved=resolved, dimred_cfg=dim_cfg)
-                                dim_target = torch.nan_to_num(dim_target, nan=0.0, posinf=0.0, neginf=0.0)
-                                dim_stats = importance_stats(dim_target)
-                                if prompt_idx == prompt_start_idx:
-                                    print(f"[stats] prompt_{prompt_idx:03d} {a_tag}/{d_tag} dimred={dim_stats}")
-
-                                dim_res = compute_soft_norm_metrics_a4(
-                                    model=hf_model,
-                                    source_ids=src_ids,
-                                    generated_ids=gen_ids,
-                                    importance_map=dim_target,
-                                    metric_stride=metric_stride,
-                                    debug_steps=debug_metric_steps,
-                                )
-                                save_json(prompt_dir / f"{a_tag}_dimred_{d_tag}.json", dim_res)
-                                save_softnorm_steps_csv(prompt_dir / f"{a_tag}_dimred_{d_tag}_steps.csv", dim_res)
-                                _log_stage_end(
-                                    prompt_idx,
-                                    "metrics_dimred",
-                                    t_dim_metrics,
-                                    f"attr_tag={a_tag} dimred_tag={d_tag}",
-                                )
-
-                                debug_payload["attr_debug"][a_tag].setdefault("dimred", {})[d_tag] = {
-                                    "stats": dim_stats,
-                                    "warnings": dim_res.get("warnings", []),
-                                }
-                                save_json(prompt_dir / "debug.json", debug_payload)
-                            except Exception as e:
-                                _log_stage_end(
-                                    prompt_idx,
-                                    "metrics_dimred",
-                                    t_dim_metrics,
-                                    f"attr_tag={a_tag} dimred_tag={d_tag} failed",
-                                )
-                                append_error(
-                                    prompt_dir,
-                                    build_error_payload(
-                                        "dimred_metrics",
-                                        prompt_idx,
-                                        e,
-                                        attr_tag=a_tag,
-                                        dimred_tag=d_tag,
-                                    ),
-                                )
-                            continue
-                    except Exception as e:
-                        if t_attr_stage is not None:
-                            _log_stage_end(prompt_idx, "attribution", t_attr_stage, f"attr_tag={a_tag} failed")
-                        append_error(
-                            prompt_dir,
-                            build_error_payload("attribution", prompt_idx, e, attr_tag=a_tag),
-                        )
-                        continue
-                    finally:
-                        gc.collect()
-                        clear_device_cache(chosen_device)
-                        print(
-                            f"[cache] {_ts_now()} | prompt_{prompt_idx:03d} | cleared after attr_tag={a_tag}",
-                            flush=True,
-                        )
-
-                gc.collect()
-                clear_device_cache(chosen_device)
+    run_grid(
+        base_path=args.base,
+        grid_path=args.grid,
+        max_prompts=args.max_prompts,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":

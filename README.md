@@ -55,15 +55,13 @@ outputs/<model_slug>/<dataset_slug>/
   run_meta.json
   prompts/
     prompt_000/
-      debug.json
+      prompt.json
       <aTag>_baseline.json
-      <aTag>_baseline_steps.csv
       <aTag>_dimred_<dTag>.json
-      <aTag>_dimred_<dTag>_steps.csv
       error.json            # only when failures happen
 ```
 
-`aTag` / `dTag` are short stable tags; method params are stored in `attr_index.json` / `dimred_index.json`.
+`prompt.json` stores prompt-level metadata. Each combo JSON stores only the result payload for that prompt/combo, including per-generated-token values and the mean values across generated tokens. `aTag` / `dTag` are short stable tags; method params are stored in `attr_index.json` / `dimred_index.json`.
 
 ## Notes
 

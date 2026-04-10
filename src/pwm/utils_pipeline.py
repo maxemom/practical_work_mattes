@@ -4,7 +4,9 @@ import json
 import os
 import random
 import re
+import sys
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +36,237 @@ ALLOWED_DIMRED_METHODS = {
     "nmf",
     "kernel_pca",
 }
+
+
+def disable_loading_verbosity() -> None:
+    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass
+
+
+def configure_runtime_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message="Setting forward, backward hooks and attributes on non-linear",
+        category=UserWarning,
+    )
+
+
+def patch_lxt_transformers_compatibility() -> None:
+    """
+    Keep optional LXT imports working on newer transformers versions where some
+    older compatibility symbols were removed.
+    """
+    try:
+        import transformers.pytorch_utils as pytorch_utils
+    except Exception:
+        return
+
+    if not hasattr(pytorch_utils, "find_pruneable_heads_and_indices"):
+        def find_pruneable_heads_and_indices(
+            heads: Any,
+            n_heads: int,
+            head_size: int,
+            already_pruned_heads: Any,
+        ) -> tuple[set[int], torch.Tensor]:
+            pruned_heads = {int(head) for head in already_pruned_heads}
+            remaining_heads = {int(head) for head in heads} - pruned_heads
+            kept_indices = [
+                idx
+                for head in range(int(n_heads))
+                if head not in remaining_heads
+                for idx in range(head * int(head_size), (head + 1) * int(head_size))
+            ]
+            return remaining_heads, torch.tensor(kept_indices, dtype=torch.long)
+
+        pytorch_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+
+    try:
+        from transformers.models.roberta import modeling_roberta
+    except Exception:
+        return
+
+    if (
+        not hasattr(modeling_roberta, "RobertaSdpaSelfAttention")
+        and hasattr(modeling_roberta, "RobertaSelfAttention")
+    ):
+        modeling_roberta.RobertaSdpaSelfAttention = modeling_roberta.RobertaSelfAttention
+
+
+def patch_lxt_attention_interface_compatibility() -> None:
+    """
+    LXT expects ALL_ATTENTION_FUNCTIONS to be a plain dict, while newer
+    transformers expose an AttentionInterface object with get_interface().
+    """
+    try:
+        from lxt.efficient import patches as lxt_patches
+    except Exception:
+        return
+
+    if getattr(lxt_patches, "_pwm_attention_interface_patch", False):
+        return
+
+    original_patch_attention = lxt_patches.patch_attention
+    original_patch_cp_attention = lxt_patches.patch_cp_attention
+
+    def _patch_attention_collection(module: Any, wrap_fn: Any) -> bool:
+        new_forward = wrap_fn(module.eager_attention_forward)
+        if lxt_patches.check_already_patched(module.eager_attention_forward, new_forward):
+            return False
+        module.eager_attention_forward = new_forward
+
+        attention_functions = getattr(module, "ALL_ATTENTION_FUNCTIONS", None)
+        if attention_functions is None:
+            return True
+
+        patched_functions: Dict[str, Any] = {}
+        for key, value in list(attention_functions.items()):
+            new_value = wrap_fn(value)
+            if lxt_patches.check_already_patched(value, new_value):
+                return False
+            patched_functions[key] = new_value
+
+        if hasattr(attention_functions, "get_interface"):
+            attention_functions.update(patched_functions)
+        else:
+            module.ALL_ATTENTION_FUNCTIONS = patched_functions
+        return True
+
+    def patch_attention(module: Any) -> bool:
+        return _patch_attention_collection(module, lxt_patches.wrap_attention_forward)
+
+    def patch_cp_attention(module: Any) -> bool:
+        return _patch_attention_collection(module, lxt_patches.cp_wrap_attention_forward)
+
+    lxt_patches.patch_attention = patch_attention
+    lxt_patches.patch_cp_attention = patch_cp_attention
+
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.startswith("lxt.efficient.models."):
+            continue
+        for mapping_name, old_fn, new_fn in (
+            ("attnLRP", original_patch_attention, patch_attention),
+            ("cp_LRP", original_patch_cp_attention, patch_cp_attention),
+        ):
+            patch_map = getattr(module, mapping_name, None)
+            if not isinstance(patch_map, dict):
+                continue
+            for key, value in list(patch_map.items()):
+                if value is old_fn:
+                    patch_map[key] = new_fn
+
+    lxt_patches._pwm_attention_interface_patch = True
+
+
+def patch_inseq_value_zeroing_tensor_output() -> None:
+    """
+    Inseq's ValueZeroing hook assumes tuple outputs, but recent decoder blocks
+    may return a bare Tensor. Support both shapes.
+    """
+    try:
+        from inseq.attr.feat.ops.value_zeroing import ValueZeroing
+    except Exception:
+        return
+
+    if getattr(ValueZeroing, "_pwm_tensor_output_patch", False):
+        return
+
+    def get_states_extract_and_patch_hook(self, block_idx: int, hidden_state_idx: int = 0) -> Any:
+        def states_extract_and_patch_forward_hook(module: Any, args: Any, output: Any) -> Any:
+            del module, args
+            if isinstance(output, torch.Tensor):
+                self.corrupted_block_output_states[block_idx] = output.clone().float().detach().cpu()
+                return self.clean_block_output_states[block_idx].to(output.device)
+
+            hidden_state = output[hidden_state_idx]
+            self.corrupted_block_output_states[block_idx] = hidden_state.clone().float().detach().cpu()
+            clean_state = self.clean_block_output_states[block_idx].to(hidden_state.device)
+
+            if isinstance(output, tuple):
+                return output[:hidden_state_idx] + (clean_state,) + output[hidden_state_idx + 1 :]
+            if isinstance(output, list):
+                patched = list(output)
+                patched[hidden_state_idx] = clean_state
+                return patched
+            return output
+
+        return states_extract_and_patch_forward_hook
+
+    ValueZeroing.get_states_extract_and_patch_hook = get_states_extract_and_patch_hook
+    ValueZeroing._pwm_tensor_output_patch = True
+
+
+def register_inseq_model_configs() -> None:
+    try:
+        import inseq
+    except Exception:
+        return
+
+    patch_inseq_value_zeroing_tensor_output()
+
+    registrations = [
+        (
+            "Gemma3ForCausalLM",
+            {
+                "self_attention_module": "self_attn",
+                "value_vector": "value_states",
+                "cross_attention_module": None,
+            },
+        ),
+        (
+            "Phi3ForCausalLM",
+            {
+                "self_attention_module": "self_attn",
+                "value_vector": "value_states",
+                "cross_attention_module": None,
+            },
+        ),
+        (
+            "MistralForCausalLM",
+            {
+                "self_attention_module": "self_attn",
+                "value_vector": "value_states",
+                "cross_attention_module": None,
+            },
+        ),
+        (
+            "Qwen3ForCausalLM",
+            {
+                "self_attention_module": "self_attn",
+                "value_vector": "value_states",
+                "cross_attention_module": None,
+            },
+        ),
+        (
+            "Qwen2ForCausalLM",
+            {
+                "self_attention_module": "self_attn",
+                "value_vector": "value_states",
+                "cross_attention_module": None,
+            },
+        ),
+    ]
+
+    for model_type, config in registrations:
+        try:
+            inseq.register_model_config(model_type=model_type, config=config, overwrite=True)
+        except Exception:
+            continue
+
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
+    except Exception:
+        pass
 
 
 def safe_name(text: str) -> str:
@@ -182,7 +415,7 @@ def load_prompts(dataset_cfg: Dict[str, Any], max_prompts: Optional[int]) -> Lis
     return prompts
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def hf_generate_once(
     model: Any,
     tokenizer: Any,
@@ -203,8 +436,10 @@ def hf_generate_once(
         top_p=float(generation_cfg.get("top_p", 1.0)),
         pad_token_id=int(tokenizer.pad_token_id),
     )
-    generated_ids = gen_ids[0].detach().cpu().long()
-    source_ids = input_ids[0].detach().cpu().long()
+    # Keep these as regular tensors so later attribution/metric stages can use
+    # them in autograd-tracked code paths without inference-mode restrictions.
+    generated_ids = gen_ids[0].detach().cpu().long().clone()
+    source_ids = input_ids[0].detach().cpu().long().clone()
     full_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
     return source_ids, generated_ids, full_text
 

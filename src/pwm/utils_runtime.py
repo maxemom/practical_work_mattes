@@ -121,6 +121,18 @@ class GenerationReport:
     source: str  # where overrides came from (e.g. "model.params")
 
 
+DTYPE_ALIASES: Dict[str, torch.dtype] = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float": torch.float32,
+}
+
+
 # Whitelist: only keys that should be treated as generation settings
 GENERATION_KEYS = {
     "max_new_tokens",
@@ -173,6 +185,44 @@ def apply_generation_overrides(resolved: Dict[str, Any]) -> GenerationReport:
         overridden=overridden,
         source="model.params",
     )
+
+
+def resolve_model_dtype(resolved: Dict[str, Any]) -> tuple[Optional[torch.dtype], str]:
+    runtime = resolved.get("runtime", {}) or {}
+    model_params = resolved.get("model", {}).get("params", {}) or {}
+    requested = model_params.get("dtype", runtime.get("dtype", "auto"))
+    device = str(runtime.get("device", "cpu")).lower()
+
+    if requested is None:
+        requested = "auto"
+
+    if isinstance(requested, torch.dtype):
+        return requested, str(requested).replace("torch.", "")
+
+    requested_name = str(requested).strip().lower()
+    if requested_name != "auto":
+        if requested_name not in DTYPE_ALIASES:
+            raise ValueError(
+                f"Unknown dtype '{requested}'. Supported: auto, {sorted(DTYPE_ALIASES.keys())}"
+            )
+        return DTYPE_ALIASES[requested_name], requested_name
+
+    if device.startswith("cuda"):
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16, "bfloat16"
+            return torch.float16, "float16"
+        return torch.float32, "float32"
+
+    if device == "mps":
+        # MPS is prone to mixed-dtype matmul assertion failures with decoder
+        # models and attribution forwards. Prefer fp32 by default for stability.
+        return torch.float32, "float32"
+
+    if device == "cpu":
+        return torch.float32, "float32"
+
+    return torch.float32, "float32"
 
 
 def build_resolved_run_config(
