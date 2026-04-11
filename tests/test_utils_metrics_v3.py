@@ -15,7 +15,7 @@ if str(SRC) not in sys.path:
 torch = pytest.importorskip("torch")
 nn = pytest.importorskip("torch.nn")
 
-from pwm.utils_metrics_V3 import compute_soft_norm_metrics_v3
+from pwm.utils_metrics_strict import compute_strict_soft_metrics
 
 
 class TinyCausalLM(nn.Module):
@@ -61,92 +61,86 @@ def _build_importance_map() -> torch.Tensor:
     )
 
 
-def test_compute_soft_norm_metrics_v3_exposes_random_baseline_fields() -> None:
+def test_compute_strict_soft_metrics_exposes_random_baseline_fields() -> None:
     torch.manual_seed(0)
     model = TinyCausalLM()
     source_ids = torch.tensor([1, 2, 3], dtype=torch.long)
     generated_ids = torch.tensor([4, 5], dtype=torch.long)
+    total_ids = torch.cat([source_ids, generated_ids])
 
-    result = compute_soft_norm_metrics_v3(
+    result = compute_strict_soft_metrics(
         model,
-        source_ids,
-        generated_ids,
+        total_ids,
+        len(source_ids),
         _build_importance_map(),
         seed=123,
-        num_mc_samples=4,
-        rationale_size_mode="all_mass",
     )
 
     expected_len = len(result.target_pos)
     assert expected_len == len(generated_ids)
-    assert len(result.random_soft_ns) == expected_len
-    assert len(result.random_soft_nc) == expected_len
-    assert len(result.log_soft_ns_over_random) == expected_len
-    assert len(result.log_soft_nc_over_random) == expected_len
-    assert math.isfinite(result.random_soft_ns_mean)
-    assert math.isfinite(result.random_soft_nc_mean)
-    assert math.isfinite(result.log_soft_ns_over_random_mean)
-    assert math.isfinite(result.log_soft_nc_over_random_mean)
+    assert len(result.random_soft_ns_per_token) == expected_len
+    assert len(result.random_soft_nc_per_token) == expected_len
+    assert len(result.final_sufficiency_per_token) == expected_len
+    assert len(result.final_comprehensiveness_per_token) == expected_len
+    assert math.isfinite(result.soft_ns_mean)
+    assert math.isfinite(result.soft_nc_mean)
+    assert math.isfinite(result.final_sufficiency_mean)
+    assert math.isfinite(result.final_comprehensiveness_mean)
 
 
-def test_compute_soft_norm_metrics_v3_random_baseline_is_reproducible() -> None:
+def test_compute_strict_soft_metrics_random_baseline_is_reproducible() -> None:
     torch.manual_seed(0)
     model = TinyCausalLM()
     source_ids = torch.tensor([2, 1, 4], dtype=torch.long)
     generated_ids = torch.tensor([3, 5], dtype=torch.long)
+    total_ids = torch.cat([source_ids, generated_ids])
     importance_map = _build_importance_map()
 
-    result_a = compute_soft_norm_metrics_v3(
+    result_a = compute_strict_soft_metrics(
         model,
-        source_ids,
-        generated_ids,
+        total_ids,
+        len(source_ids),
         importance_map,
         seed=77,
-        num_mc_samples=5,
-        rationale_size_mode="effective_support",
     )
-    result_b = compute_soft_norm_metrics_v3(
+    result_b = compute_strict_soft_metrics(
         model,
-        source_ids,
-        generated_ids,
+        total_ids,
+        len(source_ids),
         importance_map,
         seed=77,
-        num_mc_samples=5,
-        rationale_size_mode="effective_support",
     )
 
-    assert result_a.random_soft_ns == pytest.approx(result_b.random_soft_ns)
-    assert result_a.random_soft_nc == pytest.approx(result_b.random_soft_nc)
-    assert result_a.log_soft_ns_over_random == pytest.approx(result_b.log_soft_ns_over_random)
-    assert result_a.log_soft_nc_over_random == pytest.approx(result_b.log_soft_nc_over_random)
-    assert result_a.random_soft_ns_mean == pytest.approx(result_b.random_soft_ns_mean)
-    assert result_a.random_soft_nc_mean == pytest.approx(result_b.random_soft_nc_mean)
-    assert result_a.log_soft_ns_over_random_mean == pytest.approx(result_b.log_soft_ns_over_random_mean)
-    assert result_a.log_soft_nc_over_random_mean == pytest.approx(result_b.log_soft_nc_over_random_mean)
+    assert result_a.random_soft_ns_per_token == pytest.approx(result_b.random_soft_ns_per_token)
+    assert result_a.random_soft_nc_per_token == pytest.approx(result_b.random_soft_nc_per_token)
+    assert result_a.final_sufficiency_per_token == pytest.approx(result_b.final_sufficiency_per_token)
+    assert result_a.final_comprehensiveness_per_token == pytest.approx(result_b.final_comprehensiveness_per_token)
+    assert result_a.soft_ns_mean == pytest.approx(result_b.soft_ns_mean)
+    assert result_a.soft_nc_mean == pytest.approx(result_b.soft_nc_mean)
+    assert result_a.final_sufficiency_mean == pytest.approx(result_b.final_sufficiency_mean)
+    assert result_a.final_comprehensiveness_mean == pytest.approx(result_b.final_comprehensiveness_mean)
 
 
-def test_compute_soft_norm_metrics_v3_log_ratios_are_finite_for_zero_signal() -> None:
+def test_compute_strict_soft_metrics_log_ratios_are_finite_for_zero_signal() -> None:
     model = ZeroCausalLM()
     source_ids = torch.tensor([1, 2, 3], dtype=torch.long)
     generated_ids = torch.tensor([4, 5], dtype=torch.long)
+    total_ids = torch.cat([source_ids, generated_ids])
     importance_map = _build_importance_map()
 
-    result = compute_soft_norm_metrics_v3(
+    result = compute_strict_soft_metrics(
         model,
-        source_ids,
-        generated_ids,
+        total_ids,
+        len(source_ids),
         importance_map,
         seed=5,
-        num_mc_samples=3,
-        rationale_size_mode="fraction",
-        rationale_fraction=0.5,
     )
 
-    assert result.soft_ns == pytest.approx([0.0, 0.0])
-    assert result.soft_nc == pytest.approx([0.0, 0.0])
-    assert result.random_soft_ns == pytest.approx([0.0, 0.0])
-    assert result.random_soft_nc == pytest.approx([0.0, 0.0])
-    assert result.log_soft_ns_over_random == pytest.approx([0.0, 0.0])
-    assert result.log_soft_nc_over_random == pytest.approx([0.0, 0.0])
-    assert math.isfinite(result.log_soft_ns_over_random_mean)
-    assert math.isfinite(result.log_soft_nc_over_random_mean)
+    assert result.soft_ns_per_token == pytest.approx([0.0, 0.0])
+    assert result.soft_nc_per_token == pytest.approx([0.0, 0.0])
+    assert result.random_soft_ns_per_token == pytest.approx([0.0, 0.0])
+    assert result.random_soft_nc_per_token == pytest.approx([0.0, 0.0])
+    assert result.final_sufficiency_per_token == pytest.approx([0.0, 0.0])
+    assert result.final_comprehensiveness_per_token == pytest.approx([0.0, 0.0])
+    assert math.isfinite(result.final_sufficiency_mean)
+    assert math.isfinite(result.final_comprehensiveness_mean)

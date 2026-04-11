@@ -380,15 +380,15 @@ def test_create_all_plots_respects_grid_model_dataset_selection(tmp_path: Path) 
     set_paper_plot_style()
     _build_run_dir(
         tmp_path / "outputs",
-        model_slug="demo_model",
-        dataset_slug="demo_dataset",
+        model_slug="demo-model",
+        dataset_slug="demo-dataset",
         model_name="demo-model",
         dataset_name="demo-dataset",
     )
     _build_run_dir(
         tmp_path / "outputs",
-        model_slug="other_model",
-        dataset_slug="other_dataset",
+        model_slug="other-model",
+        dataset_slug="other-dataset",
         model_name="other-model",
         dataset_name="other-dataset",
     )

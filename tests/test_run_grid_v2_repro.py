@@ -23,7 +23,7 @@ from pwm.utils_pipeline import (
     patch_lxt_transformers_compatibility,
     register_inseq_model_configs,
 )
-from pwm.utils_results_V2 import save_baseline_result_v2, save_dimred_result_v2
+from pwm.utils_results import save_json
 from pwm.utils_runtime import build_resolved_run_config, resolve_model_dtype
 
 
@@ -162,7 +162,7 @@ def test_build_indices_use_readable_tags() -> None:
     assert list(dimreds.keys()) == ["pca_n_components_1", "pca_n_components_2", "nmf"]
 
 
-def test_v2_result_writers_only_create_json(tmp_path: Path) -> None:
+def test_save_json_result_writer_only_creates_json(tmp_path: Path) -> None:
     result = {
         "soft_ns_mean": 0.5,
         "soft_nc_mean": 0.25,
@@ -170,8 +170,8 @@ def test_v2_result_writers_only_create_json(tmp_path: Path) -> None:
         "target_token_id": [7],
     }
 
-    save_baseline_result_v2(tmp_path, "saliency", result)
-    save_dimred_result_v2(tmp_path, "saliency", "pca_n_components_2", result)
+    save_json(tmp_path / "saliency_baseline.json", result)
+    save_json(tmp_path / "saliency_dimred_pca_n_components_2.json", result)
 
     assert (tmp_path / "saliency_baseline.json").exists()
     assert (tmp_path / "saliency_dimred_pca_n_components_2.json").exists()
