@@ -5,9 +5,12 @@ __pycache__/
 *.pyd
 .DS_Store
 
-# keep datasets out of the image (mount processed data at runtime)
-data/
+# keep raw/cache data out of the image; processed prompts are included
+data/raw/
+data/downloads/
+data/cache/
 outputs/
+Nico_Filzberger/
 
 # notebooks / experiments
 notebooks/
@@ -18,3 +21,4 @@ notebooks/
 *.bin
 *.safetensors
 .cache/
+.hf_cache/

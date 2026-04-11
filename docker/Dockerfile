@@ -1,11 +1,5 @@
 FROM mambaorg/micromamba:1.5.8
 
-COPY src/ /workspace/src/
-COPY scripts/ /workspace/scripts/
-COPY configs/ /workspace/configs/
-USER root
-USER $MAMBA_USER
-
 # 1) Nur die Environment-Definition kopieren, damit Docker caching sauber funktioniert
 COPY --chown=$MAMBA_USER:$MAMBA_USER environment.yml /tmp/environment.yml
 
@@ -17,6 +11,7 @@ RUN micromamba create -y -f /tmp/environment.yml && \
 ENV MAMBA_DOCKERFILE_ACTIVATE=1
 
 # 4) Projektcode kopieren (ändert sich häufig -> später in der Layer-Reihenfolge)
+WORKDIR /workspace
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /workspace
 
 # Default: interaktive Shell

@@ -4,6 +4,8 @@ data/downloads/
 data/cache/
 outputs/
 Nico_Filzberger/
+notebooks/
+.hf_cache/
 
 # python
 __pycache__/
