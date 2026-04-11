@@ -9,32 +9,68 @@ This repository runs a reproducible pipeline for decoder-only LLM attribution:
 
 ## Run with Docker
 
-Build the image from the repository root. The processed prompt files under `data/processed/` are copied into the image, so rebuild the image after changing those files.
+The Docker setup is intended as a reproducible CPU-based environment check. On macOS, Docker Desktop runs Linux containers and does not expose Apple MPS to the container. Use the local Conda environment for MPS runs.
+
+Build the image from the repository root:
 
 ```bash
-docker build -t pwm -f docker/Dockerfile .
+docker compose -f docker/docker-compose.yml build
+```
+
+Run the test suite:
+
+```bash
+docker compose -f docker/docker-compose.yml run --rm pwm pytest -q -rs
 ```
 
 Run the full pipeline by running `scripts/main` (`run_grid` followed by plot creation). `outputs/` is mounted so results are written back to the host machine, and `.hf_cache/` is mounted so Hugging Face model downloads are reused across runs without being copied into the image:
 
 ```bash
-mkdir -p outputs .hf_cache
-docker run --rm \
-  -v "$PWD/outputs:/workspace/outputs" \
-  -v "$PWD/.hf_cache:/workspace/.cache/huggingface" \
-  pwm python scripts/main.py --base configs/base.yaml --grid configs/grid.yaml --skip-prepare
+docker compose -f docker/docker-compose.yml run --rm pwm \
+  python scripts/main.py --base configs/base.yaml --grid configs/grid.yaml --skip-prepare
 ```
-
-The Docker image does not include Hugging Face model weights. The first run needs internet access from inside the container, or an already populated `.hf_cache/` directory containing the configured model. The runtime device is configured in `configs/base.yaml` under `runtime.device` (`auto`, `cpu`, or `mps`). `scripts/prepare_dataset.py` can still be used locally to create or update files under `data/processed/`; after changing processed data, rebuild the Docker image.
 
 Alternatively, run only the experiment grid without plots:
 
 ```bash
-docker run --rm \
-  -v "$PWD/outputs:/workspace/outputs" \
-  -v "$PWD/.hf_cache:/workspace/.cache/huggingface" \
-  pwm python scripts/run_grid.py --base configs/base.yaml --grid configs/grid.yaml
+docker compose -f docker/docker-compose.yml run --rm pwm \
+  python scripts/run_grid.py --base configs/base.yaml --grid configs/grid.yaml
 ```
+
+The Docker image installs PyTorch CPU wheels plus the LXT package from GitHub. This keeps the image smaller and is sufficient for smoke tests and reproducibility checks. The Docker image does not include Hugging Face model weights. The first run needs internet access from inside the container, or an already populated `.hf_cache/` directory containing the configured model.
+
+`scripts/prepare_dataset.py` can still be used locally to create or update files under `data/processed/`; after changing processed data, rebuild the Docker image.
+
+## Local Mac MPS Runs
+
+For efficient local experiments on Apple Silicon, run outside Docker in the local Conda environment:
+
+```bash
+conda activate pwm
+python -c "import torch; print(torch.backends.mps.is_available())"
+```
+
+Set the runtime in `configs/base.yaml`:
+
+```yaml
+runtime:
+  device: mps
+  dtype: float32
+```
+
+Then run a small local check:
+
+```bash
+python scripts/run_grid.py --max-prompts 1
+```
+
+or the full pipeline:
+
+```bash
+python scripts/main.py --skip-prepare
+```
+
+CUDA execution is supported by the runtime device resolver, but it has not been verified by the author in this repository. Test CUDA on the target machine before relying on it for full experiments.
 
 ## Output Layout
 
