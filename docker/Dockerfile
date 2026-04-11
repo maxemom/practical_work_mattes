@@ -1,17 +1,40 @@
-FROM mambaorg/micromamba:1.5.8
+FROM python:3.11-slim
 
-USER root
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-USER $MAMBA_USER
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MPLCONFIGDIR=/tmp/matplotlib
 
-COPY --chown=$MAMBA_USER:$MAMBA_USER environment.yml /tmp/environment.yml
-
-RUN micromamba create -y -f /tmp/environment.yml && \
-    micromamba clean --all --yes
-
-ENV MAMBA_DOCKERFILE_ACTIVATE=1
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-COPY --chown=$MAMBA_USER:$MAMBA_USER . /workspace
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+RUN python -m pip install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch \
+    torchvision
+
+RUN python -m pip install \
+    transformers \
+    accelerate \
+    inseq \
+    numpy \
+    pandas \
+    scikit-learn \
+    scipy \
+    pyyaml \
+    matplotlib \
+    pytest \
+    pipdeptree \
+    python-slugify \
+    "git+https://github.com/niggoo/LRP-eXplains-Transformers.git"
+
+COPY . /workspace
+
+RUN python -m pip install -e .
 
 CMD ["bash"]

@@ -25,7 +25,7 @@ docker run --rm \
   pwm python scripts/main.py --base configs/base.yaml --grid configs/grid.yaml --skip-prepare
 ```
 
-The Docker image does not include Hugging Face model weights. The first run needs internet access from inside the container, or an already populated `.hf_cache/` directory containing the configured model. The runtime device is configured in `configs/base.yaml` under `runtime.device` (`auto`, `cpu`, `cuda`, `cuda:0`, or `mps`). `scripts/prepare_dataset.py` can still be used locally to create or update files under `data/processed/`; after changing processed data, rebuild the Docker image.
+The Docker image does not include Hugging Face model weights. The first run needs internet access from inside the container, or an already populated `.hf_cache/` directory containing the configured model. The runtime device is configured in `configs/base.yaml` under `runtime.device` (`auto`, `cpu`, or `mps`). `scripts/prepare_dataset.py` can still be used locally to create or update files under `data/processed/`; after changing processed data, rebuild the Docker image.
 
 Alternatively, run only the experiment grid without plots:
 
