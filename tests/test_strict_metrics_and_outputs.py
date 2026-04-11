@@ -20,7 +20,7 @@ nn = pytest.importorskip("torch.nn")
 from pwm.typess import MethodResult
 from pwm.utils_dimred import reduce_raw_targets_to_importance
 from pwm.utils_metrics_strict import compute_strict_soft_metrics
-from scripts.interpret_outputs import build_long_form
+from scripts.create_plots import load_run_records
 from scripts.run_grid import build_combo_aggregates, save_prompt_outputs, summarize_aggregate
 from pwm.typess import PromptRunResult
 
@@ -209,7 +209,7 @@ def test_save_prompt_outputs_writes_promptwise_layout(tmp_path: Path) -> None:
     assert (prompt_dir / "saliency_baseline.json").exists()
 
 
-def test_build_long_form_reads_promptwise_layout(tmp_path: Path) -> None:
+def test_load_run_records_reads_promptwise_layout(tmp_path: Path) -> None:
     run_dir = tmp_path / "demo_model" / "demo_dataset"
     prompt_dir = run_dir / "prompts" / "prompt_000"
     prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -250,12 +250,12 @@ def test_build_long_form_reads_promptwise_layout(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    df = build_long_form(tmp_path)
+    df = load_run_records(run_dir).records
 
     assert df.shape[0] == 1
     row = df.iloc[0]
     assert row["model_name"] == "demo-model"
     assert row["dataset_name"] == "demo-dataset"
-    assert row["attribution"] == "saliency"
-    assert row["dimred"] == "baseline"
+    assert row["attribution_name"] == "saliency"
+    assert row["dimred_name"] == "baseline"
     assert int(row["prompt_idx"]) == 0
