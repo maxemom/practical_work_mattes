@@ -6,10 +6,10 @@ models:
 
 datasets:
   - name: tellmewhy
-    path: data/processed/tellmewhy_5_seed42.txt
+    path: data/processed/tellmewhy_100_seed42.txt
 
   - name: wikitext2
-    path: data/processed/wikitext2_5_seed42.txt
+    path: data/processed/wikitext2_100_seed42.txt
 
 attribution_functions:
   - name: saliency
@@ -42,18 +42,58 @@ dimensionality_reduction_methods:
     params:
       n_components: 1
 
+  - name: pca
+    params:
+      n_components: 3
+
+  - name: pca
+    params:
+      n_components: 5
+
   - name: factor_analysis
     params:
       n_components: 1
+
+  - name: factor_analysis
+    params:
+      n_components: 3
+
+  - name: factor_analysis
+    params:
+      n_components: 5
 
   - name: ica
     params:
       n_components: 1
 
+  - name: ica
+    params:
+      n_components: 3
+
+  - name: ica
+    params:
+      n_components: 5
+
   - name: kernel_pca
+    params:
+      n_components: 1
+
+  - name: kernel_pca
+    params:
+      n_components: 3
+
+  - name: kernel_pca
+    params:
+      n_components: 5
+
+  - name: nmf
     params:
       n_components: 1
 
   - name: nmf
     params:
-      n_components: 1
+      n_components: 3
+
+  - name: nmf
+    params:
+      n_components: 5

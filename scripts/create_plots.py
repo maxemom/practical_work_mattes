@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -404,6 +405,35 @@ def _dimred_display_label(run: RunRecords, dimred_tag: str, dimred_name: str) ->
     return _pretty_name(dimred_name)
 
 
+def _extract_n_components(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        component_count = int(value)
+    except Exception:
+        return None
+    if component_count <= 0:
+        return None
+    return component_count
+
+
+def _dimred_n_components(run: RunRecords, dimred_tag: str, dimred_params: Dict[str, Any] | None = None) -> int | None:
+    params = dict(dimred_params or {})
+    component_count = _extract_n_components(params.get("n_components"))
+    if component_count is not None:
+        return component_count
+
+    index_params = dict(run.dimred_index.get(dimred_tag, {}).get("params", {}) or {})
+    component_count = _extract_n_components(index_params.get("n_components"))
+    if component_count is not None:
+        return component_count
+
+    match = re.search(r"(?:^|_)n_components_(\d+)(?:_|$)", safe_name(dimred_tag))
+    if match:
+        return _extract_n_components(match.group(1))
+    return None
+
+
 def summarize_records(records: pd.DataFrame) -> pd.DataFrame:
     if records.empty:
         return pd.DataFrame()
@@ -580,7 +610,7 @@ def plot_baseline_bars(
     colors = plt.cm.tab10(np.linspace(0.0, 0.9, len(methods)))
     x = np.arange(len(methods))
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(10, len(methods) * 1.35), 4.5))
+    fig, axes = plt.subplots(1, 2, figsize=(max(8.5, len(methods) * 1.15), 4.1))
     for ax, values, errors, ylabel, show_zero in (
         (axes[0], suff_values, suff_errors, "Soft Suff", True),
         (axes[1], comp_values, comp_errors, "Soft Comp", False),
@@ -687,7 +717,7 @@ def plot_baseline_stat_heatmaps(
             pvalue_matrices[prefix][y, x] = float(row.get(f"{prefix}_p_value", float("nan")))
             count_matrices[prefix][y, x] = float(row.get(f"{prefix}_nonzero_pairs", float("nan")))
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(dimred_tags) * 1.45), max(5.6, len(attr_tags) * 0.76)))
+    fig, axes = plt.subplots(1, 2, figsize=(max(9.8, len(dimred_tags) * 1.25), max(4.8, len(attr_tags) * 0.68)))
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
 
     for ax, (prefix, title) in zip(axes, metric_configs):
@@ -817,7 +847,7 @@ def plot_metric_heatmaps(
         comp_mean[y, x] = float(row["soft_comp_mean"])
         comp_std[y, x] = float(row["soft_comp_std"])
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(12, len(dimred_tags) * 1.4), max(5.2, len(attr_tags) * 0.72)))
+    fig, axes = plt.subplots(1, 2, figsize=(max(9.8, len(dimred_tags) * 1.2), max(4.6, len(attr_tags) * 0.64)))
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
 
     configs = [
@@ -863,6 +893,207 @@ def plot_metric_heatmaps(
     fig.subplots_adjust(top=0.9)
 
     path = out_dir / f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}__metric_heatmaps.png"
+    save_figure(fig, path)
+    return path
+
+
+def _ordered_component_dimred_names(run: RunRecords, records: pd.DataFrame) -> list[str]:
+    ordered: list[str] = []
+    for _, meta in run.dimred_index.items():
+        name = str(meta.get("name", ""))
+        if not name or safe_name(name) == "baseline":
+            continue
+        params = dict(meta.get("params", {}) or {})
+        if _extract_n_components(params.get("n_components")) is None:
+            continue
+        if name not in ordered:
+            ordered.append(name)
+
+    if not records.empty:
+        for name in records["dimred_name"].dropna().astype(str).drop_duplicates().tolist():
+            if safe_name(name) == "baseline":
+                continue
+            if name not in ordered:
+                ordered.append(name)
+    return ordered
+
+
+def _best_n_component_dimred_tags(run: RunRecords, records: pd.DataFrame) -> list[str]:
+    if records.empty:
+        return []
+
+    ordered_tags = _ordered_dimred_tags(run, records)
+    present_tags = set(records["dimred_tag"].dropna().astype(str).tolist())
+    selected_tags: set[str] = set()
+
+    usable = records[~records["skipped"]].copy()
+    if not usable.empty:
+        usable["dimred_n_components"] = usable.apply(
+            lambda row: _dimred_n_components(
+                run,
+                str(row["dimred_tag"]),
+                dict(row.get("dimred_params", {}) or {}),
+            ),
+            axis=1,
+        )
+        component_records = usable[
+            usable["dimred_n_components"].notna()
+            & (usable["dimred_name"].astype(str).map(safe_name) != "baseline")
+        ].copy()
+
+        if not component_records.empty:
+            component_records["dimred_n_components"] = component_records["dimred_n_components"].astype(int)
+            component_summary = (
+                component_records.groupby(["dimred_name", "dimred_tag", "dimred_n_components"], as_index=False)
+                .agg(
+                    soft_suff_mean=("soft_ns_mean", "mean"),
+                    soft_comp_mean=("soft_nc_mean", "mean"),
+                    sample_count=("prompt_idx", "count"),
+                )
+            )
+            component_summary["soft_suff_rank"] = component_summary.groupby("dimred_name")["soft_suff_mean"].rank(
+                method="min",
+                ascending=False,
+                na_option="bottom",
+            )
+            component_summary["soft_comp_rank"] = component_summary.groupby("dimred_name")["soft_comp_mean"].rank(
+                method="min",
+                ascending=False,
+                na_option="bottom",
+            )
+            component_summary["best_rank"] = (
+                component_summary["soft_suff_rank"] + component_summary["soft_comp_rank"]
+            ) / 2.0
+            component_summary = component_summary.sort_values(
+                ["dimred_name", "best_rank", "dimred_n_components", "sample_count", "dimred_tag"],
+                ascending=[True, True, True, False, True],
+            )
+            best_rows = component_summary.drop_duplicates(subset=["dimred_name"], keep="first")
+            selected_tags.update(best_rows["dimred_tag"].astype(str).tolist())
+
+    for tag in ordered_tags:
+        matches = records[records["dimred_tag"].astype(str) == tag]
+        if matches.empty:
+            continue
+        sample = matches.iloc[0]
+        dimred_name = str(sample["dimred_name"])
+        n_components = _dimred_n_components(run, str(tag), dict(sample.get("dimred_params", {}) or {}))
+        if safe_name(dimred_name) == "baseline" or n_components is None:
+            selected_tags.add(str(tag))
+
+    return [tag for tag in ordered_tags if tag in present_tags and tag in selected_tags]
+
+
+def filter_to_best_n_components_per_dimred(run: RunRecords, records: pd.DataFrame) -> pd.DataFrame:
+    if records.empty:
+        return records.copy()
+    selected_tags = _best_n_component_dimred_tags(run, records)
+    if not selected_tags:
+        return records.iloc[0:0].copy()
+    return records[records["dimred_tag"].astype(str).isin(selected_tags)].copy()
+
+
+def plot_n_components_comparison(
+    run: RunRecords,
+    records: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+) -> Path | None:
+    if records.empty:
+        return None
+
+    usable = records[~records["skipped"]].copy()
+    if usable.empty:
+        return None
+
+    usable["dimred_n_components"] = usable.apply(
+        lambda row: _dimred_n_components(
+            run,
+            str(row["dimred_tag"]),
+            dict(row.get("dimred_params", {}) or {}),
+        ),
+        axis=1,
+    )
+    usable = usable[usable["dimred_n_components"].notna()].copy()
+    usable = usable[usable["dimred_name"].astype(str).map(safe_name) != "baseline"].copy()
+    if usable.empty:
+        return None
+
+    usable["dimred_n_components"] = usable["dimred_n_components"].astype(int)
+    component_summary = (
+        usable.groupby(["dimred_name", "dimred_n_components"], as_index=False)
+        .agg(
+            sample_count=("prompt_idx", "count"),
+            prompt_count=("prompt_idx", "nunique"),
+            attribution_count=("attribution_tag", "nunique"),
+            soft_suff_mean=("soft_ns_mean", "mean"),
+            soft_suff_std=("soft_ns_mean", _std),
+            soft_comp_mean=("soft_nc_mean", "mean"),
+            soft_comp_std=("soft_nc_mean", _std),
+        )
+    )
+    if component_summary.empty:
+        return None
+
+    dimred_names = [
+        name
+        for name in _ordered_component_dimred_names(run, usable)
+        if name in set(component_summary["dimred_name"].astype(str).tolist())
+    ]
+    if not dimred_names:
+        dimred_names = component_summary["dimred_name"].astype(str).drop_duplicates().tolist()
+
+    component_values = sorted(component_summary["dimred_n_components"].astype(int).drop_duplicates().tolist())
+    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(1, len(dimred_names))))
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(10.5, len(component_values) * 1.2 + len(dimred_names) * 0.7), 4.7))
+    metric_configs = [
+        (axes[0], "soft_suff_mean", "soft_suff_std", "Soft Suff", True),
+        (axes[1], "soft_comp_mean", "soft_comp_std", "Soft Comp", False),
+    ]
+
+    for ax, mean_col, std_col, ylabel, show_zero in metric_configs:
+        all_values: list[float] = []
+        for color, dimred_name in zip(colors, dimred_names):
+            subset = component_summary[component_summary["dimred_name"].astype(str) == dimred_name].sort_values("dimred_n_components")
+            x = subset["dimred_n_components"].to_numpy(dtype=int)
+            y = subset[mean_col].to_numpy(dtype=float)
+            yerr = subset[std_col].to_numpy(dtype=float)
+            all_values.extend(float(value) for value in y if np.isfinite(value))
+            ax.errorbar(
+                x,
+                y,
+                yerr=yerr,
+                marker="o",
+                markersize=5,
+                capsize=3,
+                linewidth=1.8,
+                color=color,
+                label=_pretty_name(str(dimred_name)),
+            )
+
+        ax.set_xlabel("n_components")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(component_values)
+        ax.grid(axis="both", alpha=0.18)
+        if show_zero:
+            ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_ylim(*_dynamic_limits(all_values, include_zero=show_zero))
+        ax.set_title(ylabel)
+
+    axes[1].legend(title="DimRed", loc="best", frameon=True)
+    fig.suptitle(
+        f"n_components comparison | {run.model_name} | {run.dataset_name} | {selection_title} | averaged over attribution methods",
+        y=0.98,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.84)
+
+    path = out_dir / (
+        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+        "__n_components_comparison.png"
+    )
     save_figure(fig, path)
     return path
 
@@ -996,8 +1227,8 @@ def plot_token_attribution_rows(
     cmap = plt.cm.Purples
 
     row_gap = 2.25
-    fig_height = max(3.4, len(prompt_records) * 1.9 + 1.0)
-    fig_width = max(12.0, total_width * 0.34)
+    fig_height = max(3.2, len(prompt_records) * 1.65 + 0.9)
+    fig_width = max(10.0, total_width * 0.31)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.axis("off")
 
@@ -1110,6 +1341,7 @@ def create_all_plots(
     skip_bar_plot: bool = False,
     skip_stat_plot: bool = False,
     skip_heatmap_plot: bool = False,
+    skip_component_plot: bool = False,
     skip_token_plot: bool = False,
     token_attribution: str | None = None,
     token_dimreds: Sequence[str] | None = None,
@@ -1183,6 +1415,9 @@ def create_all_plots(
             print(f"[skip] {run.run_label}: no successful records after prompt filtering")
             report["skipped"].append({"run_dir": str(run_dir), "reason": "no_successful_records_after_prompt_filtering"})
             continue
+        plot_records = filter_to_best_n_components_per_dimred(run, filtered_records)
+        plot_summary_df = summarize_records(plot_records)
+        plot_stats_df = compute_baseline_comparison_stats(plot_records, alpha=stat_alpha)
 
         run_plot_dir = resolved_plot_root / run.run_label
         run_plot_dir.mkdir(parents=True, exist_ok=True)
@@ -1190,11 +1425,16 @@ def create_all_plots(
         summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__summary.csv", index=False)
         if not stats_df.empty:
             stats_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__baseline_stats.csv", index=False)
+        if not plot_summary_df.empty:
+            plot_summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__best_n_components_summary.csv", index=False)
+        if not plot_stats_df.empty:
+            plot_stats_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__best_n_components_baseline_stats.csv", index=False)
 
         generated_paths: dict[str, list[str]] = {
             "bars": [],
             "stats": [],
             "heatmaps": [],
+            "components": [],
             "tokens": [],
         }
 
@@ -1202,11 +1442,11 @@ def create_all_plots(
             try:
                 bar_dimred_queries = [bar_dimred]
                 if all_bar_dimreds:
-                    bar_dimred_queries = _available_dimred_tags(run, summary_df)
+                    bar_dimred_queries = _available_dimred_tags(run, plot_summary_df)
                 for dimred_query in bar_dimred_queries:
                     path = plot_baseline_bars(
                         run=run,
-                        summary_df=summary_df,
+                        summary_df=plot_summary_df,
                         selected_prompt_indices=selected_prompt_indices,
                         out_dir=run_plot_dir,
                         dimred_query=dimred_query,
@@ -1220,7 +1460,7 @@ def create_all_plots(
             try:
                 path = plot_baseline_stat_heatmaps(
                     run=run,
-                    stats_df=stats_df,
+                    stats_df=plot_stats_df,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                     alpha=stat_alpha,
@@ -1234,7 +1474,7 @@ def create_all_plots(
             try:
                 path = plot_metric_heatmaps(
                     run=run,
-                    summary_df=summary_df,
+                    summary_df=plot_summary_df,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                     suff_vmin=suff_vmin,
@@ -1247,15 +1487,28 @@ def create_all_plots(
             except Exception as exc:
                 print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
 
+        if not skip_component_plot:
+            try:
+                path = plot_n_components_comparison(
+                    run=run,
+                    records=filtered_records,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                )
+                if path is not None:
+                    generated_paths["components"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: n_components plot failed: {exc}")
+
         if not skip_token_plot:
             try:
                 token_attr_queries = [token_attribution]
                 if all_token_attributions:
-                    token_attr_queries = _available_attr_tags(run, filtered_records)
+                    token_attr_queries = _available_attr_tags(run, plot_records)
                 for token_attr_query in token_attr_queries:
                     path = plot_token_attribution_rows(
                         run=run,
-                        records=filtered_records,
+                        records=plot_records,
                         selected_prompt_indices=selected_prompt_indices,
                         out_dir=run_plot_dir,
                         token_prompt_idx=token_prompt_idx,
@@ -1314,6 +1567,7 @@ def main() -> None:
     parser.add_argument("--skip-bar-plot", action="store_true")
     parser.add_argument("--skip-stat-plot", action="store_true")
     parser.add_argument("--skip-heatmap-plot", action="store_true")
+    parser.add_argument("--skip-component-plot", action="store_true")
     parser.add_argument("--skip-token-plot", action="store_true")
     parser.add_argument("--stat-alpha", type=float, default=0.05)
     parser.add_argument(
@@ -1368,6 +1622,7 @@ def main() -> None:
         skip_bar_plot=args.skip_bar_plot,
         skip_stat_plot=args.skip_stat_plot,
         skip_heatmap_plot=args.skip_heatmap_plot,
+        skip_component_plot=args.skip_component_plot,
         skip_token_plot=args.skip_token_plot,
         token_attribution=args.token_attribution,
         token_dimreds=token_dimred_queries,

@@ -25,10 +25,12 @@ from scripts.create_plots import (
     _selected_prompt_indices,
     compute_baseline_comparison_stats,
     create_all_plots,
+    filter_to_best_n_components_per_dimred,
     load_run_records,
     plot_baseline_bars,
     plot_baseline_stat_heatmaps,
     plot_metric_heatmaps,
+    plot_n_components_comparison,
     plot_token_attribution_rows,
     set_paper_plot_style,
     summarize_records,
@@ -65,6 +67,7 @@ def _build_run_dir(
         {
             "baseline": {"name": "baseline", "params": {"norm": "l2"}, "index": 0},
             "pca_n_components_1": {"name": "pca", "params": {"n_components": 1}, "index": 1},
+            "pca_n_components_3": {"name": "pca", "params": {"n_components": 3}, "index": 2},
         },
     )
 
@@ -142,6 +145,30 @@ def _build_run_dir(
                 "soft_nc_mean": 0.5,
                 "final_sufficiency_mean": 0.3,
                 "final_comprehensiveness_mean": 0.7,
+                "target_pos": [2, 3],
+                "target_token_ids": [12, 13],
+                "target_token_texts": [" ans", " wer"],
+                "warnings": [],
+                "skipped": False,
+                "skip_reason": None,
+            },
+            "saliency_dimred_pca_n_components_3.json": {
+                "combo_key": "saliency__pca_n_components_3",
+                "attribution_tag": "saliency",
+                "attribution_name": "saliency",
+                "attribution_params": {},
+                "dimred_tag": "pca_n_components_3",
+                "dimred_name": "pca",
+                "dimred_params": {"n_components": 3},
+                "importance_scores": [[0.4, 0.2], [0.5, 0.3], [None, 0.3], [None, None]],
+                "soft_ns_per_token": [0.3, 0.2],
+                "soft_nc_per_token": [0.6, 0.6],
+                "final_sufficiency_per_token": [0.4, 0.3],
+                "final_comprehensiveness_per_token": [0.8, 0.8],
+                "soft_ns_mean": 0.3,
+                "soft_nc_mean": 0.6,
+                "final_sufficiency_mean": 0.4,
+                "final_comprehensiveness_mean": 0.8,
                 "target_pos": [2, 3],
                 "target_token_ids": [12, 13],
                 "target_token_texts": [" ans", " wer"],
@@ -247,6 +274,30 @@ def _build_run_dir(
                 "skipped": False,
                 "skip_reason": None,
             },
+            "saliency_dimred_pca_n_components_3.json": {
+                "combo_key": "saliency__pca_n_components_3",
+                "attribution_tag": "saliency",
+                "attribution_name": "saliency",
+                "attribution_params": {},
+                "dimred_tag": "pca_n_components_3",
+                "dimred_name": "pca",
+                "dimred_params": {"n_components": 3},
+                "importance_scores": [[0.5, 0.6], [0.4, 0.7], [None, 0.4], [None, None]],
+                "soft_ns_per_token": [0.6, 0.6],
+                "soft_nc_per_token": [0.9, 0.9],
+                "final_sufficiency_per_token": [0.6, 0.6],
+                "final_comprehensiveness_per_token": [1.0, 1.0],
+                "soft_ns_mean": 0.6,
+                "soft_nc_mean": 0.9,
+                "final_sufficiency_mean": 0.6,
+                "final_comprehensiveness_mean": 1.0,
+                "target_pos": [2, 3],
+                "target_token_ids": [22, 23],
+                "target_token_texts": [" foo", " bar"],
+                "warnings": [],
+                "skipped": False,
+                "skip_reason": None,
+            },
             "deeplift_baseline.json": {
                 "combo_key": "deeplift__baseline",
                 "attribution_tag": "deeplift",
@@ -322,7 +373,7 @@ def test_summarize_records_aggregates_selected_prompts(tmp_path: Path) -> None:
     run_dir = _build_run_dir(tmp_path)
     run = load_run_records(run_dir)
 
-    assert run.records.shape[0] == 8
+    assert run.records.shape[0] == 10
 
     all_summary = summarize_records(run.records)
     saliency_baseline = all_summary[
@@ -349,7 +400,17 @@ def test_available_attr_and_dimred_tags_cover_present_records(tmp_path: Path) ->
     summary = summarize_records(run.records)
 
     assert _available_attr_tags(run, run.records) == ["saliency", "deeplift"]
-    assert _available_dimred_tags(run, summary) == ["baseline", "pca_n_components_1"]
+    assert _available_dimred_tags(run, summary) == ["baseline", "pca_n_components_1", "pca_n_components_3"]
+
+
+def test_filter_to_best_n_components_keeps_baseline_and_best_component(tmp_path: Path) -> None:
+    run_dir = _build_run_dir(tmp_path)
+    run = load_run_records(run_dir)
+
+    filtered = filter_to_best_n_components_per_dimred(run, run.records)
+    dimred_tags = filtered["dimred_tag"].dropna().astype(str).drop_duplicates().tolist()
+
+    assert dimred_tags == ["baseline", "pca_n_components_3"]
 
 
 def test_compute_baseline_comparison_stats_pairs_against_l2_baseline(tmp_path: Path) -> None:
@@ -419,7 +480,7 @@ datasets:
     assert not (tmp_path / "plots" / "other-model__other-dataset").exists()
 
 
-def test_create_plots_writes_all_three_plot_types(tmp_path: Path) -> None:
+def test_create_plots_writes_all_plot_types(tmp_path: Path) -> None:
     set_paper_plot_style()
     run_dir = _build_run_dir(tmp_path)
     run = load_run_records(run_dir)
@@ -431,6 +492,7 @@ def test_create_plots_writes_all_three_plot_types(tmp_path: Path) -> None:
     bars_path = plot_baseline_bars(run, summary, selected_prompt_indices, plot_dir)
     stat_path = plot_baseline_stat_heatmaps(run, stats, selected_prompt_indices, plot_dir)
     heatmap_path = plot_metric_heatmaps(run, summary, selected_prompt_indices, plot_dir)
+    component_path = plot_n_components_comparison(run, run.records, selected_prompt_indices, plot_dir)
     token_path = plot_token_attribution_rows(
         run,
         run.records,
@@ -444,4 +506,5 @@ def test_create_plots_writes_all_three_plot_types(tmp_path: Path) -> None:
     assert bars_path is not None and bars_path.exists()
     assert stat_path is not None and stat_path.exists()
     assert heatmap_path is not None and heatmap_path.exists()
+    assert component_path is not None and component_path.exists()
     assert token_path is not None and token_path.exists()
