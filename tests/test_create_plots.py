@@ -25,11 +25,14 @@ from scripts.create_plots import (
     _selected_prompt_indices,
     compute_baseline_comparison_stats,
     create_all_plots,
+    filter_to_n_components_per_dimred,
     filter_to_best_n_components_per_dimred,
     load_run_records,
     plot_baseline_bars,
     plot_baseline_stat_heatmaps,
+    plot_dimred_bars_per_attribution,
     plot_metric_heatmaps,
+    plot_metric_heatmaps_all_dimreds,
     plot_n_components_comparison,
     plot_token_attribution_rows,
     set_paper_plot_style,
@@ -413,6 +416,17 @@ def test_filter_to_best_n_components_keeps_baseline_and_best_component(tmp_path:
     assert dimred_tags == ["baseline", "pca_n_components_3"]
 
 
+def test_filter_to_n_components_keeps_baseline_and_requested_component(tmp_path: Path) -> None:
+    run_dir = _build_run_dir(tmp_path)
+    run = load_run_records(run_dir)
+
+    filtered = filter_to_n_components_per_dimred(run, run.records, n_components=1)
+    dimred_tags = filtered["dimred_tag"].dropna().astype(str).drop_duplicates().tolist()
+
+    assert dimred_tags == ["baseline", "pca_n_components_1"]
+    assert _available_dimred_tags(run, filtered) == ["baseline", "pca_n_components_1"]
+
+
 def test_compute_baseline_comparison_stats_pairs_against_l2_baseline(tmp_path: Path) -> None:
     run_dir = _build_run_dir(tmp_path)
     run = load_run_records(run_dir)
@@ -492,7 +506,9 @@ def test_create_plots_writes_all_plot_types(tmp_path: Path) -> None:
     bars_path = plot_baseline_bars(run, summary, selected_prompt_indices, plot_dir)
     stat_path = plot_baseline_stat_heatmaps(run, stats, selected_prompt_indices, plot_dir)
     heatmap_path = plot_metric_heatmaps(run, summary, selected_prompt_indices, plot_dir)
+    full_heatmap_path = plot_metric_heatmaps_all_dimreds(run, summary, selected_prompt_indices, plot_dir)
     component_path = plot_n_components_comparison(run, run.records, selected_prompt_indices, plot_dir)
+    dimred_bar_paths = plot_dimred_bars_per_attribution(run, summary, selected_prompt_indices, plot_dir)
     token_path = plot_token_attribution_rows(
         run,
         run.records,
@@ -506,5 +522,48 @@ def test_create_plots_writes_all_plot_types(tmp_path: Path) -> None:
     assert bars_path is not None and bars_path.exists()
     assert stat_path is not None and stat_path.exists()
     assert heatmap_path is not None and heatmap_path.exists()
+    assert full_heatmap_path is not None and full_heatmap_path.exists()
     assert component_path is not None and component_path.exists()
+    assert len(dimred_bar_paths) == 2
+    assert all(path.exists() for path in dimred_bar_paths)
     assert token_path is not None and token_path.exists()
+
+
+def test_create_all_plots_writes_special_attribution_plots_only_for_special_dataset(tmp_path: Path) -> None:
+    set_paper_plot_style()
+    _build_run_dir(
+        tmp_path / "outputs",
+        model_slug="demo-model",
+        dataset_slug="special-dataset",
+        model_name="demo-model",
+        dataset_name="Sentences_for_attribution_plots",
+    )
+    _build_run_dir(
+        tmp_path / "outputs",
+        model_slug="demo-model",
+        dataset_slug="regular-dataset",
+        model_name="demo-model",
+        dataset_name="demo-dataset",
+    )
+
+    report = create_all_plots(
+        output_root=str(tmp_path / "outputs"),
+        plot_dir=str(tmp_path / "plots"),
+        all_bar_dimreds=False,
+        all_token_attributions=False,
+        local_files_only=True,
+    )
+
+    runs = {entry["run_label"]: entry for entry in report["runs"]}
+    special_entry = runs["demo-model__sentences_for_attribution_plots"]
+    regular_entry = runs["demo-model__demo-dataset"]
+
+    special_paths = [Path(path) for path in special_entry["generated_paths"]["special_attribution"]]
+    assert len(special_paths) == 2
+    assert all(path.exists() for path in special_paths)
+    assert all("Special Attribution" in str(path) for path in special_paths)
+    assert all("__target_2__" in path.name for path in special_paths)
+    assert len(special_entry["generated_paths"]["dimred_bars_per_attribution"]) == 2
+    assert len(special_entry["generated_paths"]["heatmaps_all_dimreds"]) == 1
+
+    assert regular_entry["generated_paths"]["special_attribution"] == []

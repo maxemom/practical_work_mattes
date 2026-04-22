@@ -28,6 +28,9 @@ if str(SRC) not in sys.path:
 from pwm.utils_base import load_yaml
 from pwm.utils_pipeline import safe_name
 
+SPECIAL_ATTRIBUTION_DIRNAME = "Special Attribution"
+SPECIAL_ATTRIBUTION_DATASET_SLUGS = {"sentences_for_attribution_plots"}
+
 
 @dataclass
 class RunRecords:
@@ -669,6 +672,29 @@ def _resolve_diverging_limits(matrix: np.ndarray) -> tuple[float, float]:
     return (-max_abs, max_abs)
 
 
+def filter_to_n_components_per_dimred(
+    run: RunRecords,
+    records: pd.DataFrame,
+    *,
+    n_components: int,
+    include_baseline: bool = True,
+) -> pd.DataFrame:
+    if records.empty:
+        return records.copy()
+
+    selected_rows: list[bool] = []
+    for _, row in records.iterrows():
+        dimred_tag = str(row.get("dimred_tag", ""))
+        dimred_name = str(row.get("dimred_name", ""))
+        dimred_params = dict(row.get("dimred_params", {}) or {}) if "dimred_params" in records.columns else {}
+        if dimred_tag == "baseline" or safe_name(dimred_name) == "baseline":
+            selected_rows.append(include_baseline)
+            continue
+        selected_rows.append(_dimred_n_components(run, dimred_tag, dimred_params) == int(n_components))
+
+    return records.loc[selected_rows].copy()
+
+
 def plot_baseline_stat_heatmaps(
     run: RunRecords,
     stats_df: pd.DataFrame,
@@ -679,9 +705,12 @@ def plot_baseline_stat_heatmaps(
 ) -> Path | None:
     if stats_df.empty:
         return None
+    stats_df = filter_to_n_components_per_dimred(run, stats_df, n_components=1, include_baseline=True)
+    if stats_df.empty:
+        return None
 
-    attr_tags = _ordered_attr_tags(run, stats_df)
-    dimred_tags = _ordered_dimred_tags(run, stats_df)
+    attr_tags = _available_attr_tags(run, stats_df)
+    dimred_tags = _available_dimred_tags(run, stats_df)
     attr_labels = {}
     for tag in attr_tags:
         matches = stats_df[stats_df["attribution_tag"] == tag]
@@ -717,7 +746,17 @@ def plot_baseline_stat_heatmaps(
             pvalue_matrices[prefix][y, x] = float(row.get(f"{prefix}_p_value", float("nan")))
             count_matrices[prefix][y, x] = float(row.get(f"{prefix}_nonzero_pairs", float("nan")))
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(9.8, len(dimred_tags) * 1.25), max(4.8, len(attr_tags) * 0.68)))
+    # Give each heatmap cell enough room for the three-line statistical label.
+    cell_width = 1.6
+    cell_height = 0.95
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(
+            max(12.5, len(dimred_tags) * cell_width * 2.0),
+            max(5.8, len(attr_tags) * cell_height + 1.8),
+        ),
+    )
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
 
     for ax, (prefix, title) in zip(axes, metric_configs):
@@ -761,7 +800,7 @@ def plot_baseline_stat_heatmaps(
                     text,
                     ha="center",
                     va="center",
-                    fontsize=7.8,
+                    fontsize=8.0,
                     color=_heatmap_text_color(delta_value, norm),
                 )
 
@@ -769,7 +808,7 @@ def plot_baseline_stat_heatmaps(
         cbar.set_label("Delta vs baseline")
 
     fig.suptitle(
-        f"Paired sign test vs L2 baseline | {run.model_name} | {run.dataset_name} | {selection_title} | alpha={alpha:.2f}",
+        f"Paired sign test vs L2 baseline (baseline + k=1) | {run.model_name} | {run.dataset_name} | {selection_title} | alpha={alpha:.2f}",
         y=0.98,
     )
     fig.tight_layout()
@@ -817,9 +856,12 @@ def plot_metric_heatmaps(
 ) -> Path | None:
     if summary_df.empty:
         return None
+    summary_df = filter_to_n_components_per_dimred(run, summary_df, n_components=1, include_baseline=True)
+    if summary_df.empty:
+        return None
 
-    attr_tags = _ordered_attr_tags(run, summary_df)
-    dimred_tags = _ordered_dimred_tags(run, summary_df)
+    attr_tags = _available_attr_tags(run, summary_df)
+    dimred_tags = _available_dimred_tags(run, summary_df)
     attr_labels = {}
     for tag in attr_tags:
         matches = summary_df[summary_df["attribution_tag"] == tag]
@@ -888,11 +930,175 @@ def plot_metric_heatmaps(
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(title)
 
-    fig.suptitle(f"{run.model_name} | {run.dataset_name} | {selection_title}", y=0.98)
+    fig.suptitle(f"{run.model_name} | {run.dataset_name} | {selection_title} | baseline + k=1 variants", y=0.98)
     fig.tight_layout()
     fig.subplots_adjust(top=0.9)
 
     path = out_dir / f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}__metric_heatmaps.png"
+    save_figure(fig, path)
+    return path
+
+
+def plot_dimred_bars_per_attribution(
+    run: RunRecords,
+    summary_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+) -> list[Path]:
+    if summary_df.empty:
+        return []
+
+    attr_tags = _ordered_attr_tags(run, summary_df)
+    dimred_tags = _ordered_dimred_tags(run, summary_df)
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    saved_paths: list[Path] = []
+
+    for attr_tag in attr_tags:
+        subset = summary_df[summary_df["attribution_tag"].astype(str) == attr_tag].copy()
+        if subset.empty:
+            continue
+
+        subset["dimred_order"] = subset["dimred_tag"].map({tag: idx for idx, tag in enumerate(dimred_tags)})
+        subset = subset.sort_values(["dimred_order", "dimred_tag"])
+        dimred_labels = [
+            _dimred_display_label(run, str(row["dimred_tag"]), str(row["dimred_name"]))
+            for _, row in subset.iterrows()
+        ]
+        suff_values = subset["soft_suff_mean"].to_numpy(dtype=float)
+        comp_values = subset["soft_comp_mean"].to_numpy(dtype=float)
+        suff_errors = subset["soft_suff_std"].to_numpy(dtype=float)
+        comp_errors = subset["soft_comp_std"].to_numpy(dtype=float)
+        x = np.arange(subset.shape[0])
+        colors = plt.cm.tab20(np.linspace(0.0, 0.95, max(1, subset.shape[0])))
+
+        fig, axes = plt.subplots(1, 2, figsize=(max(10.5, subset.shape[0] * 1.15), 4.4))
+        metric_configs = [
+            (axes[0], suff_values, suff_errors, "Soft Sufficiency", True),
+            (axes[1], comp_values, comp_errors, "Soft Comprehensiveness", False),
+        ]
+        for ax, values, errors, ylabel, show_zero in metric_configs:
+            ax.bar(x, values, yerr=errors, capsize=4, color=colors, edgecolor="#1F2933", linewidth=0.8)
+            ax.set_xticks(x)
+            ax.set_xticklabels(dimred_labels, rotation=45, ha="right")
+            ax.set_xlabel("Dimensionality reduction method")
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", alpha=0.18)
+            if show_zero:
+                ax.axhline(0.0, color="black", linewidth=0.8)
+            ax.set_ylim(*_dynamic_limits(values, include_zero=show_zero))
+
+        attr_name = _pretty_name(str(subset["attribution_name"].iloc[0]))
+        fig.suptitle(
+            f"Dimensionality reduction comparison for {attr_name} | {run.model_name} | {run.dataset_name} | {selection_title}",
+            y=0.98,
+        )
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.84)
+
+        path = out_dir / (
+            f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+            f"__{attr_tag}__dimred_bars.png"
+        )
+        save_figure(fig, path)
+        saved_paths.append(path)
+
+    return saved_paths
+
+
+def plot_metric_heatmaps_all_dimreds(
+    run: RunRecords,
+    summary_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+    *,
+    suff_vmin: float | None = None,
+    suff_vmax: float | None = None,
+    comp_vmin: float | None = None,
+    comp_vmax: float | None = None,
+) -> Path | None:
+    if summary_df.empty:
+        return None
+
+    attr_tags = _ordered_attr_tags(run, summary_df)
+    dimred_tags = _ordered_dimred_tags(run, summary_df)
+    attr_labels = {}
+    for tag in attr_tags:
+        matches = summary_df[summary_df["attribution_tag"] == tag]
+        label = matches["attribution_name"].iloc[0] if not matches.empty else run.attr_index.get(tag, {}).get("name", tag)
+        attr_labels[tag] = _pretty_name(str(label))
+
+    dimred_labels = {}
+    for tag in dimred_tags:
+        matches = summary_df[summary_df["dimred_tag"] == tag]
+        dimred_name = matches["dimred_name"].iloc[0] if not matches.empty else run.dimred_index.get(tag, {}).get("name", tag)
+        dimred_labels[tag] = _dimred_display_label(run, tag, str(dimred_name))
+
+    dimred_to_y = {tag: idx for idx, tag in enumerate(dimred_tags)}
+    attr_to_x = {tag: idx for idx, tag in enumerate(attr_tags)}
+    suff_mean = np.full((len(dimred_tags), len(attr_tags)), np.nan, dtype=float)
+    suff_std = np.full_like(suff_mean, np.nan)
+    comp_mean = np.full_like(suff_mean, np.nan)
+    comp_std = np.full_like(suff_mean, np.nan)
+
+    for _, row in summary_df.iterrows():
+        y = dimred_to_y[str(row["dimred_tag"])]
+        x = attr_to_x[str(row["attribution_tag"])]
+        suff_mean[y, x] = float(row["soft_suff_mean"])
+        suff_std[y, x] = float(row["soft_suff_std"])
+        comp_mean[y, x] = float(row["soft_comp_mean"])
+        comp_std[y, x] = float(row["soft_comp_std"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(10.2, len(attr_tags) * 1.15), max(5.2, len(dimred_tags) * 0.64)))
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    configs = [
+        (axes[0], suff_mean, suff_std, "Soft Sufficiency", "Greens", suff_vmin, suff_vmax),
+        (axes[1], comp_mean, comp_std, "Soft Comprehensiveness", "Reds", comp_vmin, comp_vmax),
+    ]
+
+    for ax, mean_matrix, std_matrix, title, cmap_name, lower, upper in configs:
+        vmin, vmax = _resolve_color_limits(mean_matrix, lower, upper)
+        im = ax.imshow(mean_matrix, aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
+        ax.set_xticks(np.arange(len(attr_tags)))
+        ax.set_xticklabels([attr_labels[tag] for tag in attr_tags], rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(dimred_tags)))
+        ax.set_yticklabels([dimred_labels[tag] for tag in dimred_tags])
+        ax.set_title(title)
+
+        ax.set_xticks(np.arange(-0.5, len(attr_tags), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(dimred_tags), 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        for y in range(mean_matrix.shape[0]):
+            for x in range(mean_matrix.shape[1]):
+                value = mean_matrix[y, x]
+                deviation = std_matrix[y, x]
+                text = "NA" if not np.isfinite(value) else f"{value:.2f}\n+/-{deviation:.2f}"
+                ax.text(
+                    x,
+                    y,
+                    text,
+                    ha="center",
+                    va="center",
+                    fontsize=8.2,
+                    color=_heatmap_text_color(value, norm),
+                )
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(title)
+
+    fig.suptitle(
+        f"{run.model_name} | {run.dataset_name} | {selection_title} | all DimRed variants",
+        y=0.98,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.89)
+
+    path = out_dir / (
+        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+        "__metric_heatmaps_all_dimreds.png"
+    )
     save_figure(fig, path)
     return path
 
@@ -1140,11 +1346,25 @@ def _resolve_token_target_pos(record: pd.Series, token_target_pos: int | None) -
     return chosen_target_pos, target_positions.index(chosen_target_pos)
 
 
+def _resolve_first_generated_token_target_pos(record: pd.Series) -> tuple[int, int]:
+    target_positions = [int(value) for value in (record.get("target_pos") or [])]
+    if not target_positions:
+        raise ValueError("Selected record does not contain target_pos values.")
+    return target_positions[0], 0
+
+
 def _matrix_from_payload(payload: Any) -> np.ndarray:
     rows: list[list[float]] = []
     for row in list(payload or []):
         rows.append([float("nan") if value is None else float(value) for value in list(row)])
     return np.asarray(rows, dtype=float)
+
+
+def _trim_plot_text(text: str | None, max_chars: int = 110) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
 
 
 def _token_layout(tokens: Sequence[str]) -> tuple[list[tuple[float, float]], float]:
@@ -1284,6 +1504,182 @@ def plot_token_attribution_rows(
     )
     save_figure(fig, path)
     return path
+
+
+def _special_dataset_identifiers(run: RunRecords) -> set[str]:
+    identifiers = {
+        safe_name(run.dataset_name),
+        safe_name(run.run_dir.name),
+    }
+
+    resolved_config_path = run.run_dir / "resolved_config.yaml"
+    if resolved_config_path.exists():
+        try:
+            resolved_cfg = load_yaml(resolved_config_path)
+        except Exception:
+            resolved_cfg = {}
+        dataset_cfg = dict(resolved_cfg.get("dataset", {}) or {})
+        dataset_name = str(dataset_cfg.get("name", "")).strip()
+        dataset_path = str(dataset_cfg.get("path", "")).strip()
+        if dataset_name:
+            identifiers.add(safe_name(dataset_name))
+        if dataset_path:
+            dataset_file = Path(dataset_path)
+            identifiers.add(safe_name(dataset_file.name))
+            identifiers.add(safe_name(dataset_file.stem))
+
+    return {identifier for identifier in identifiers if identifier}
+
+
+def _is_special_attribution_run(run: RunRecords) -> bool:
+    return not SPECIAL_ATTRIBUTION_DATASET_SLUGS.isdisjoint(_special_dataset_identifiers(run))
+
+
+def plot_special_attribution_importance_scores(
+    run: RunRecords,
+    records: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+    *,
+    local_files_only: bool = False,
+) -> list[Path]:
+    if records.empty:
+        return []
+
+    usable = records[
+        records["prompt_idx"].isin(selected_prompt_indices)
+        & (~records["skipped"])
+    ].copy()
+    if usable.empty:
+        return []
+
+    attr_order = {tag: idx for idx, tag in enumerate(_ordered_attr_tags(run, usable))}
+    dimred_order = {tag: idx for idx, tag in enumerate(_ordered_dimred_tags(run, usable))}
+    tokenizer = _resolve_tokenizer(run.model_name, local_files_only=local_files_only)
+    saved_paths: list[Path] = []
+
+    for chosen_prompt_idx in sorted(int(idx) for idx in usable["prompt_idx"].dropna().unique().tolist()):
+        prompt_records = usable[usable["prompt_idx"] == chosen_prompt_idx].copy()
+        if prompt_records.empty:
+            continue
+
+        prompt_records["attr_order"] = prompt_records["attribution_tag"].map(attr_order)
+        prompt_records["dimred_order"] = prompt_records["dimred_tag"].map(dimred_order)
+        prompt_records = prompt_records.sort_values(["attr_order", "dimred_order", "combo_key"])
+
+        anchor_record: pd.Series | None = None
+        for _, row in prompt_records.iterrows():
+            if row.get("target_pos") and row.get("total_ids"):
+                anchor_record = row
+                break
+        if anchor_record is None:
+            continue
+
+        chosen_target_pos, column_index = _resolve_first_generated_token_target_pos(anchor_record)
+        total_ids = list(anchor_record.get("total_ids", []))
+        if not total_ids:
+            continue
+
+        total_tokens = _decode_total_tokens(tokenizer, total_ids)
+        visible_len = min(len(total_tokens), chosen_target_pos + 1)
+        visible_tokens = total_tokens[:visible_len]
+        layout, total_width = _token_layout(visible_tokens)
+
+        score_arrays: list[np.ndarray] = []
+        all_scores: list[float] = []
+        for _, row in prompt_records.iterrows():
+            matrix = _matrix_from_payload(row.get("importance_scores"))
+            if matrix.ndim != 2 or matrix.shape[1] <= column_index:
+                scores = np.full((visible_len,), np.nan, dtype=float)
+            else:
+                scores = matrix[:visible_len, column_index]
+            score_arrays.append(scores)
+            all_scores.extend(
+                abs(float(score))
+                for token_idx, score in enumerate(scores)
+                if token_idx != chosen_target_pos and np.isfinite(score)
+            )
+
+        vmax = max(all_scores) if all_scores else 1.0
+        norm = mcolors.Normalize(vmin=0.0, vmax=vmax if vmax > 0 else 1.0)
+        cmap = plt.cm.YlOrRd
+
+        row_gap = 1.9
+        fig_height = max(4.6, len(prompt_records) * 0.82 + 1.4)
+        fig_width = max(11.5, total_width * 0.31)
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        ax.axis("off")
+
+        max_y = row_gap * (len(prompt_records) - 1) + 1.55
+        previous_attr_tag: str | None = None
+        for row_idx, (_, row) in enumerate(prompt_records.iterrows()):
+            base_y = max_y - row_idx * row_gap
+            attr_tag = str(row["attribution_tag"])
+            attr_title = _pretty_name(str(row["attribution_name"]))
+            dimred_title = _dimred_display_label(run, str(row["dimred_tag"]), str(row["dimred_name"]))
+            row_title = f"{attr_title} | {dimred_title}"
+
+            if previous_attr_tag is not None and attr_tag != previous_attr_tag:
+                separator_y = base_y + 0.93
+                ax.plot(
+                    [-0.15, total_width + 0.15],
+                    [separator_y, separator_y],
+                    color="#D1D5DB",
+                    linewidth=0.9,
+                    linestyle="--",
+                )
+            previous_attr_tag = attr_tag
+
+            ax.text(0.0, base_y + 0.55, row_title, ha="left", va="center", fontsize=10, fontweight="bold")
+
+            scores = score_arrays[row_idx]
+            for token_idx, ((center_x, width), token_text) in enumerate(zip(layout, visible_tokens)):
+                score = scores[token_idx] if token_idx < scores.shape[0] else float("nan")
+                if token_idx == chosen_target_pos:
+                    facecolor = "#A7E3A1"
+                    edgecolor = "#2E7D32"
+                elif np.isfinite(score):
+                    facecolor = cmap(norm(abs(float(score))))
+                    edgecolor = "#C7CAD1"
+                else:
+                    facecolor = "#F3F4F6"
+                    edgecolor = "#D1D5DB"
+
+                label = "" if not np.isfinite(score) else f"{float(score):.2f}"
+                ax.text(center_x, base_y + 0.15, label, ha="center", va="center", fontsize=7.5)
+                ax.text(
+                    center_x,
+                    base_y - 0.21,
+                    str(token_text),
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    bbox={
+                        "boxstyle": "square,pad=0.23",
+                        "facecolor": facecolor,
+                        "edgecolor": edgecolor,
+                        "linewidth": 0.8,
+                    },
+                )
+
+        prompt_text = _trim_plot_text(str(anchor_record.get("prompt") or ""))
+        title = f"{run.model_name} | {run.dataset_name} | prompt {chosen_prompt_idx:03d} | target_pos {chosen_target_pos}"
+        if prompt_text:
+            title = f"{title}\n{prompt_text}"
+        fig.suptitle(title, y=0.99)
+        ax.set_xlim(-0.35, total_width + 0.35)
+        ax.set_ylim(-0.75, max_y + 1.2)
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.9)
+
+        path = out_dir / (
+            f"{run.run_label}__prompt_{chosen_prompt_idx:03d}"
+            f"__all_attributions_all_dimreds__target_{chosen_target_pos}__importance_score.png"
+        )
+        save_figure(fig, path)
+        saved_paths.append(path)
+
+    return saved_paths
 
 
 def _filter_run_dirs(run_dirs: Sequence[Path], model_name: str | None, dataset_name: str | None) -> list[Path]:
@@ -1432,10 +1828,13 @@ def create_all_plots(
 
         generated_paths: dict[str, list[str]] = {
             "bars": [],
+            "dimred_bars_per_attribution": [],
             "stats": [],
             "heatmaps": [],
+            "heatmaps_all_dimreds": [],
             "components": [],
             "tokens": [],
+            "special_attribution": [],
         }
 
         if not skip_bar_plot:
@@ -1453,6 +1852,14 @@ def create_all_plots(
                     )
                     if path is not None:
                         generated_paths["bars"].append(str(path))
+
+                dimred_bar_paths = plot_dimred_bars_per_attribution(
+                    run=run,
+                    summary_df=summary_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                )
+                generated_paths["dimred_bars_per_attribution"].extend(str(path) for path in dimred_bar_paths)
             except Exception as exc:
                 print(f"[warn] {run.run_label}: bar plot failed: {exc}")
 
@@ -1460,7 +1867,7 @@ def create_all_plots(
             try:
                 path = plot_baseline_stat_heatmaps(
                     run=run,
-                    stats_df=plot_stats_df,
+                    stats_df=stats_df,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                     alpha=stat_alpha,
@@ -1474,7 +1881,7 @@ def create_all_plots(
             try:
                 path = plot_metric_heatmaps(
                     run=run,
-                    summary_df=plot_summary_df,
+                    summary_df=summary_df,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                     suff_vmin=suff_vmin,
@@ -1484,6 +1891,19 @@ def create_all_plots(
                 )
                 if path is not None:
                     generated_paths["heatmaps"].append(str(path))
+
+                full_heatmap_path = plot_metric_heatmaps_all_dimreds(
+                    run=run,
+                    summary_df=summary_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                    suff_vmin=suff_vmin,
+                    suff_vmax=suff_vmax,
+                    comp_vmin=comp_vmin,
+                    comp_vmax=comp_vmax,
+                )
+                if full_heatmap_path is not None:
+                    generated_paths["heatmaps_all_dimreds"].append(str(full_heatmap_path))
             except Exception as exc:
                 print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
 
@@ -1521,6 +1941,20 @@ def create_all_plots(
                         generated_paths["tokens"].append(str(path))
             except Exception as exc:
                 print(f"[warn] {run.run_label}: token plot failed: {exc}")
+
+            if _is_special_attribution_run(run):
+                try:
+                    special_plot_dir = resolved_plot_root / SPECIAL_ATTRIBUTION_DIRNAME / run.run_label
+                    special_paths = plot_special_attribution_importance_scores(
+                        run=run,
+                        records=filtered_records,
+                        selected_prompt_indices=selected_prompt_indices,
+                        out_dir=special_plot_dir,
+                        local_files_only=local_files_only,
+                    )
+                    generated_paths["special_attribution"].extend(str(path) for path in special_paths)
+                except Exception as exc:
+                    print(f"[warn] {run.run_label}: special attribution plot failed: {exc}")
 
         print(f"[ok] wrote plots to {run_plot_dir}")
         report["runs"].append(
