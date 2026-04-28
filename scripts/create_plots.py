@@ -109,6 +109,35 @@ def _std(series: pd.Series) -> float:
     return float(clean.std(ddof=1))
 
 
+def _mean_std(values: Sequence[float]) -> tuple[float, float]:
+    clean = np.asarray([float(value) for value in values if np.isfinite(value)], dtype=float)
+    if clean.size == 0:
+        return float("nan"), float("nan")
+    mean_value = float(clean.mean())
+    if clean.size <= 1:
+        return mean_value, 0.0
+    return mean_value, float(clean.std(ddof=1))
+
+
+def _correlation_coefficient(x_values: Sequence[float], y_values: Sequence[float]) -> float:
+    x = np.asarray([float(value) for value in x_values], dtype=float)
+    y = np.asarray([float(value) for value in y_values], dtype=float)
+    if x.size < 2 or y.size < 2:
+        return float("nan")
+    if math.isclose(float(np.nanstd(x)), 0.0) or math.isclose(float(np.nanstd(y)), 0.0):
+        return float("nan")
+    corr = np.corrcoef(x, y)
+    return float(corr[0, 1])
+
+
+def _spearman_correlation(x_values: Sequence[float], y_values: Sequence[float]) -> float:
+    if len(x_values) < 2 or len(y_values) < 2:
+        return float("nan")
+    x_rank = pd.Series(list(x_values), dtype=float).rank(method="average").to_numpy(dtype=float)
+    y_rank = pd.Series(list(y_values), dtype=float).rank(method="average").to_numpy(dtype=float)
+    return _correlation_coefficient(x_rank, y_rank)
+
+
 def _collect_run_dirs(output_root: Path) -> list[Path]:
     run_dirs: list[Path] = []
     for run_meta in output_root.rglob("run_meta.json"):
@@ -464,6 +493,133 @@ def summarize_records(records: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _importance_mass_vectors(row: pd.Series) -> list[np.ndarray]:
+    matrix = _matrix_from_payload(row.get("importance_scores"))
+    target_positions = [int(value) for value in (row.get("target_pos") or [])]
+    if matrix.ndim != 2 or matrix.size == 0 or not target_positions:
+        return []
+
+    vector_count = min(matrix.shape[1], len(target_positions))
+    vectors: list[np.ndarray] = []
+    for column_index in range(vector_count):
+        target_pos = target_positions[column_index]
+        if target_pos < 0:
+            continue
+        visible_len = min(matrix.shape[0], target_pos + 1)
+        if visible_len <= 0:
+            continue
+
+        scores = np.abs(matrix[:visible_len, column_index].astype(float))
+        if 0 <= target_pos < scores.shape[0]:
+            scores[target_pos] = np.nan
+        scores = scores[np.isfinite(scores)]
+        if scores.size == 0:
+            continue
+
+        total_mass = float(scores.sum())
+        if not np.isfinite(total_mass) or total_mass <= 0.0:
+            continue
+        vectors.append(scores)
+
+    return vectors
+
+
+def _normalized_entropy(probabilities: np.ndarray) -> float:
+    if probabilities.size <= 1:
+        return 0.0
+    clipped = probabilities[probabilities > 0.0]
+    if clipped.size == 0:
+        return 0.0
+    entropy = -float(np.sum(clipped * np.log(clipped)))
+    max_entropy = math.log(float(probabilities.size))
+    if max_entropy <= 0.0:
+        return 0.0
+    return entropy / max_entropy
+
+
+def _coverage_token_count(probabilities: np.ndarray, threshold: float) -> int:
+    if probabilities.size == 0:
+        return 0
+    sorted_probabilities = np.sort(probabilities)[::-1]
+    cumulative = np.cumsum(sorted_probabilities)
+    return int(np.searchsorted(cumulative, float(threshold), side="left") + 1)
+
+
+def summarize_importance_distribution(records: pd.DataFrame) -> pd.DataFrame:
+    if records.empty:
+        return pd.DataFrame()
+
+    usable = records[~records["skipped"]].copy()
+    if usable.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    group_cols = ["attribution_tag", "attribution_name", "dimred_tag", "dimred_name"]
+    for group_key, subset in usable.groupby(group_cols, sort=False):
+        top1_shares: list[float] = []
+        top3_shares: list[float] = []
+        entropy_scores: list[float] = []
+        coverage80_tokens: list[float] = []
+        coverage80_ratios: list[float] = []
+        token_counts: list[float] = []
+
+        for _, row in subset.iterrows():
+            for scores in _importance_mass_vectors(row):
+                total_mass = float(scores.sum())
+                if not np.isfinite(total_mass) or total_mass <= 0.0:
+                    continue
+
+                probabilities = scores / total_mass
+                token_count = int(probabilities.size)
+                if token_count <= 0:
+                    continue
+
+                sorted_probabilities = np.sort(probabilities)[::-1]
+                top1_shares.append(float(sorted_probabilities[:1].sum()))
+                top3_shares.append(float(sorted_probabilities[:3].sum()))
+                entropy_scores.append(_normalized_entropy(probabilities))
+
+                coverage_count = _coverage_token_count(probabilities, threshold=0.8)
+                coverage80_tokens.append(float(coverage_count))
+                coverage80_ratios.append(float(coverage_count) / float(token_count))
+                token_counts.append(float(token_count))
+
+        if not top1_shares:
+            continue
+
+        top1_mean, top1_std = _mean_std(top1_shares)
+        top3_mean, top3_std = _mean_std(top3_shares)
+        entropy_mean, entropy_std = _mean_std(entropy_scores)
+        coverage80_mean, coverage80_std = _mean_std(coverage80_tokens)
+        coverage80_ratio_mean, coverage80_ratio_std = _mean_std(coverage80_ratios)
+        token_count_mean, token_count_std = _mean_std(token_counts)
+
+        attr_tag, attr_name, dimred_tag, dimred_name = group_key
+        rows.append(
+            {
+                "attribution_tag": str(attr_tag),
+                "attribution_name": str(attr_name),
+                "dimred_tag": str(dimred_tag),
+                "dimred_name": str(dimred_name),
+                "distribution_sample_count": int(len(top1_shares)),
+                "token_count_mean": token_count_mean,
+                "token_count_std": token_count_std,
+                "top1_share_mean": top1_mean,
+                "top1_share_std": top1_std,
+                "top3_share_mean": top3_mean,
+                "top3_share_std": top3_std,
+                "normalized_entropy_mean": entropy_mean,
+                "normalized_entropy_std": entropy_std,
+                "coverage80_tokens_mean": coverage80_mean,
+                "coverage80_tokens_std": coverage80_std,
+                "coverage80_ratio_mean": coverage80_ratio_mean,
+                "coverage80_ratio_std": coverage80_ratio_std,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def _sign_test_counts(values: Sequence[float], zero_tol: float = 1e-12) -> tuple[int, int, int]:
     clean = [float(value) for value in values if np.isfinite(value)]
     positives = sum(1 for value in clean if value > zero_tol)
@@ -660,6 +816,12 @@ def _format_p_value(p_value: float) -> str:
     if p_value < 0.001:
         return "<0.001"
     return f"{p_value:.3f}"
+
+
+def _format_stat_value(value: float) -> str:
+    if not np.isfinite(value):
+        return "NA"
+    return f"{value:.3f}"
 
 
 def _resolve_diverging_limits(matrix: np.ndarray) -> tuple[float, float]:
@@ -1098,6 +1260,272 @@ def plot_metric_heatmaps_all_dimreds(
     path = out_dir / (
         f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
         "__metric_heatmaps_all_dimreds.png"
+    )
+    save_figure(fig, path)
+    return path
+
+
+def _plot_single_importance_distribution_heatmap(
+    run: RunRecords,
+    distribution_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+    *,
+    metric_prefix: str,
+    title: str,
+    cmap_name: str,
+    vmin: float,
+    vmax: float,
+    file_suffix: str,
+) -> Path | None:
+    if distribution_df.empty:
+        return None
+
+    attr_tags = _ordered_attr_tags(run, distribution_df)
+    dimred_tags = _ordered_dimred_tags(run, distribution_df)
+    attr_labels = {}
+    for tag in attr_tags:
+        matches = distribution_df[distribution_df["attribution_tag"] == tag]
+        label = matches["attribution_name"].iloc[0] if not matches.empty else run.attr_index.get(tag, {}).get("name", tag)
+        attr_labels[tag] = _pretty_name(str(label))
+
+    dimred_labels = {}
+    for tag in dimred_tags:
+        matches = distribution_df[distribution_df["dimred_tag"] == tag]
+        dimred_name = matches["dimred_name"].iloc[0] if not matches.empty else run.dimred_index.get(tag, {}).get("name", tag)
+        dimred_labels[tag] = _dimred_display_label(run, tag, str(dimred_name))
+
+    attr_to_y = {tag: idx for idx, tag in enumerate(attr_tags)}
+    dimred_to_x = {tag: idx for idx, tag in enumerate(dimred_tags)}
+    mean_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+    std_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+
+    for _, row in distribution_df.iterrows():
+        y = attr_to_y[str(row["attribution_tag"])]
+        x = dimred_to_x[str(row["dimred_tag"])]
+        mean_matrix[y, x] = float(row.get(f"{metric_prefix}_mean", float("nan")))
+        std_matrix[y, x] = float(row.get(f"{metric_prefix}_std", float("nan")))
+
+    cell_width = 1.35
+    cell_height = 0.95
+    fig, ax = plt.subplots(
+        figsize=(
+            max(7.6, len(dimred_tags) * cell_width + 1.6),
+            max(5.2, len(attr_tags) * cell_height + 1.7),
+        )
+    )
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    im = ax.imshow(mean_matrix, aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
+    ax.set_xticks(np.arange(len(dimred_tags)))
+    ax.set_xticklabels([dimred_labels[tag] for tag in dimred_tags], rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(attr_tags)))
+    ax.set_yticklabels([attr_labels[tag] for tag in attr_tags])
+    ax.set_title(title)
+
+    ax.set_xticks(np.arange(-0.5, len(dimred_tags), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(attr_tags), 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=1)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    for y in range(mean_matrix.shape[0]):
+        for x in range(mean_matrix.shape[1]):
+            value = mean_matrix[y, x]
+            deviation = std_matrix[y, x]
+            text = "NA" if not np.isfinite(value) else f"{value:.2f}\n+/-{deviation:.2f}"
+            ax.text(
+                x,
+                y,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8.0,
+                color=_heatmap_text_color(value, norm),
+            )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(title)
+
+    fig.suptitle(
+        f"Importance distribution across source tokens | {run.model_name} | {run.dataset_name} | {selection_title} | absolute importance mass",
+        y=0.98,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.9)
+
+    path = out_dir / (
+        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+        f"__{file_suffix}.png"
+    )
+    save_figure(fig, path)
+    return path
+
+
+def plot_importance_distribution_heatmaps(
+    run: RunRecords,
+    distribution_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+) -> list[Path]:
+    metric_configs = [
+        ("top1_share", "Top-1 Share", "Oranges", 0.0, 1.0, "importance_distribution_top1_share_heatmap"),
+        ("top3_share", "Top-3 Share", "Oranges", 0.0, 1.0, "importance_distribution_top3_share_heatmap"),
+        (
+            "normalized_entropy",
+            "Spread (Norm. Entropy)",
+            "Greens",
+            0.0,
+            1.0,
+            "importance_distribution_spread_heatmap",
+        ),
+    ]
+
+    saved_paths: list[Path] = []
+    for metric_prefix, title, cmap_name, vmin, vmax, file_suffix in metric_configs:
+        path = _plot_single_importance_distribution_heatmap(
+            run=run,
+            distribution_df=distribution_df,
+            selected_prompt_indices=selected_prompt_indices,
+            out_dir=out_dir,
+            metric_prefix=metric_prefix,
+            title=title,
+            cmap_name=cmap_name,
+            vmin=vmin,
+            vmax=vmax,
+            file_suffix=file_suffix,
+        )
+        if path is not None:
+            saved_paths.append(path)
+    return saved_paths
+
+
+def _top1_share_soft_comp_frame(distribution_df: pd.DataFrame, summary_df: pd.DataFrame) -> pd.DataFrame:
+    if distribution_df.empty or summary_df.empty:
+        return pd.DataFrame()
+
+    group_cols = ["attribution_tag", "attribution_name", "dimred_tag", "dimred_name"]
+    distribution_subset = distribution_df[
+        group_cols
+        + [
+            "distribution_sample_count",
+            "top1_share_mean",
+            "top1_share_std",
+        ]
+    ].copy()
+    summary_subset = summary_df[
+        group_cols
+        + [
+            "prompt_count",
+            "soft_comp_mean",
+            "soft_comp_std",
+        ]
+    ].copy()
+    merged = distribution_subset.merge(summary_subset, on=group_cols, how="inner")
+    if merged.empty:
+        return merged
+
+    mask = np.isfinite(merged["top1_share_mean"].to_numpy(dtype=float)) & np.isfinite(
+        merged["soft_comp_mean"].to_numpy(dtype=float)
+    )
+    return merged.loc[mask].copy()
+
+
+def plot_top1_share_soft_comp_correlation(
+    run: RunRecords,
+    distribution_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    selected_prompt_indices: Sequence[int],
+    out_dir: Path,
+) -> Path | None:
+    plot_df = _top1_share_soft_comp_frame(distribution_df, summary_df)
+    if plot_df.empty:
+        return None
+
+    ordered_attr_tags = _ordered_attr_tags(run, plot_df)
+    attr_present = [tag for tag in ordered_attr_tags if tag in set(plot_df["attribution_tag"].astype(str).tolist())]
+    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(1, len(attr_present))))
+    color_map = {tag: color for tag, color in zip(attr_present, colors)}
+
+    fig, ax = plt.subplots(figsize=(8.2, 5.4))
+    for attr_tag in attr_present:
+        subset = plot_df[plot_df["attribution_tag"].astype(str) == attr_tag].copy()
+        if subset.empty:
+            continue
+        attr_name = _pretty_name(str(subset["attribution_name"].iloc[0]))
+        color = color_map[attr_tag]
+        ax.errorbar(
+            subset["top1_share_mean"].to_numpy(dtype=float),
+            subset["soft_comp_mean"].to_numpy(dtype=float),
+            xerr=subset["top1_share_std"].to_numpy(dtype=float),
+            yerr=subset["soft_comp_std"].to_numpy(dtype=float),
+            fmt="o",
+            markersize=5.5,
+            capsize=3,
+            linewidth=1.0,
+            alpha=0.9,
+            color=color,
+            label=attr_name,
+        )
+        for _, row in subset.iterrows():
+            dimred_label = _dimred_display_label(run, str(row["dimred_tag"]), str(row["dimred_name"])).replace("\n", " ")
+            ax.text(
+                float(row["top1_share_mean"]) + 0.008,
+                float(row["soft_comp_mean"]) + 0.008,
+                dimred_label,
+                fontsize=7.5,
+                color=color,
+                alpha=0.9,
+            )
+
+    x_values = plot_df["top1_share_mean"].to_numpy(dtype=float)
+    y_values = plot_df["soft_comp_mean"].to_numpy(dtype=float)
+    if plot_df.shape[0] >= 2 and np.unique(x_values).size >= 2:
+        slope, intercept = np.polyfit(x_values, y_values, deg=1)
+        line_x = np.linspace(float(np.nanmin(x_values)), float(np.nanmax(x_values)), 100)
+        line_y = slope * line_x + intercept
+        ax.plot(line_x, line_y, color="#111827", linewidth=1.4, linestyle="--")
+
+    pearson_r = _correlation_coefficient(x_values, y_values)
+    spearman_rho = _spearman_correlation(x_values, y_values)
+    stats_text = (
+        f"Pearson r = {_format_stat_value(pearson_r)}\n"
+        f"Spearman rho = {_format_stat_value(spearman_rho)}\n"
+        "Negative values support: lower Top-1 -> higher Soft Comp"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        stats_text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "white",
+            "edgecolor": "#D1D5DB",
+            "alpha": 0.95,
+        },
+    )
+
+    ax.set_xlabel("Top-1 Share (lower = more distributed)")
+    ax.set_ylabel("Soft Comprehensiveness (higher = better)")
+    ax.grid(alpha=0.2)
+    ax.legend(title="Attribution", loc="best", frameon=True)
+    ax.set_xlim(*_dynamic_limits(x_values, include_zero=False))
+    ax.set_ylim(*_dynamic_limits(y_values, include_zero=False))
+
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    fig.suptitle(
+        f"Top-1 Share vs Soft Comprehensiveness | {run.model_name} | {run.dataset_name} | {selection_title}",
+        y=0.98,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    path = out_dir / (
+        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
+        "__top1_share_vs_soft_comp_correlation.png"
     )
     save_figure(fig, path)
     return path
@@ -1566,73 +1994,48 @@ def plot_special_attribution_importance_scores(
         prompt_records["attr_order"] = prompt_records["attribution_tag"].map(attr_order)
         prompt_records["dimred_order"] = prompt_records["dimred_tag"].map(dimred_order)
         prompt_records = prompt_records.sort_values(["attr_order", "dimred_order", "combo_key"])
+        prompt_dir = out_dir / f"prompt_{chosen_prompt_idx:03d}"
 
-        anchor_record: pd.Series | None = None
         for _, row in prompt_records.iterrows():
-            if row.get("target_pos") and row.get("total_ids"):
-                anchor_record = row
-                break
-        if anchor_record is None:
-            continue
+            if not row.get("target_pos") or not row.get("total_ids"):
+                continue
 
-        chosen_target_pos, column_index = _resolve_first_generated_token_target_pos(anchor_record)
-        total_ids = list(anchor_record.get("total_ids", []))
-        if not total_ids:
-            continue
+            chosen_target_pos, column_index = _resolve_first_generated_token_target_pos(row)
+            total_ids = list(row.get("total_ids", []))
+            if not total_ids:
+                continue
 
-        total_tokens = _decode_total_tokens(tokenizer, total_ids)
-        visible_len = min(len(total_tokens), chosen_target_pos + 1)
-        visible_tokens = total_tokens[:visible_len]
-        layout, total_width = _token_layout(visible_tokens)
+            total_tokens = _decode_total_tokens(tokenizer, total_ids)
+            visible_len = min(len(total_tokens), chosen_target_pos + 1)
+            visible_tokens = total_tokens[:visible_len]
+            layout, total_width = _token_layout(visible_tokens)
 
-        score_arrays: list[np.ndarray] = []
-        all_scores: list[float] = []
-        for _, row in prompt_records.iterrows():
             matrix = _matrix_from_payload(row.get("importance_scores"))
             if matrix.ndim != 2 or matrix.shape[1] <= column_index:
                 scores = np.full((visible_len,), np.nan, dtype=float)
             else:
                 scores = matrix[:visible_len, column_index]
-            score_arrays.append(scores)
-            all_scores.extend(
+
+            all_scores = [
                 abs(float(score))
                 for token_idx, score in enumerate(scores)
                 if token_idx != chosen_target_pos and np.isfinite(score)
-            )
+            ]
+            vmax = max(all_scores) if all_scores else 1.0
+            norm = mcolors.Normalize(vmin=0.0, vmax=vmax if vmax > 0 else 1.0)
+            cmap = plt.cm.YlOrRd
 
-        vmax = max(all_scores) if all_scores else 1.0
-        norm = mcolors.Normalize(vmin=0.0, vmax=vmax if vmax > 0 else 1.0)
-        cmap = plt.cm.YlOrRd
+            fig_width = max(10.8, total_width * 0.31)
+            fig, ax = plt.subplots(figsize=(fig_width, 3.4))
+            ax.axis("off")
 
-        row_gap = 1.9
-        fig_height = max(4.6, len(prompt_records) * 0.82 + 1.4)
-        fig_width = max(11.5, total_width * 0.31)
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-        ax.axis("off")
-
-        max_y = row_gap * (len(prompt_records) - 1) + 1.55
-        previous_attr_tag: str | None = None
-        for row_idx, (_, row) in enumerate(prompt_records.iterrows()):
-            base_y = max_y - row_idx * row_gap
+            base_y = 0.85
             attr_tag = str(row["attribution_tag"])
+            dimred_tag = str(row["dimred_tag"])
             attr_title = _pretty_name(str(row["attribution_name"]))
-            dimred_title = _dimred_display_label(run, str(row["dimred_tag"]), str(row["dimred_name"]))
-            row_title = f"{attr_title} | {dimred_title}"
+            dimred_title = _dimred_display_label(run, dimred_tag, str(row["dimred_name"]))
+            ax.text(0.0, base_y + 0.55, f"{attr_title} | {dimred_title}", ha="left", va="center", fontsize=10, fontweight="bold")
 
-            if previous_attr_tag is not None and attr_tag != previous_attr_tag:
-                separator_y = base_y + 0.93
-                ax.plot(
-                    [-0.15, total_width + 0.15],
-                    [separator_y, separator_y],
-                    color="#D1D5DB",
-                    linewidth=0.9,
-                    linestyle="--",
-                )
-            previous_attr_tag = attr_tag
-
-            ax.text(0.0, base_y + 0.55, row_title, ha="left", va="center", fontsize=10, fontweight="bold")
-
-            scores = score_arrays[row_idx]
             for token_idx, ((center_x, width), token_text) in enumerate(zip(layout, visible_tokens)):
                 score = scores[token_idx] if token_idx < scores.shape[0] else float("nan")
                 if token_idx == chosen_target_pos:
@@ -1662,22 +2065,19 @@ def plot_special_attribution_importance_scores(
                     },
                 )
 
-        prompt_text = _trim_plot_text(str(anchor_record.get("prompt") or ""))
-        title = f"{run.model_name} | {run.dataset_name} | prompt {chosen_prompt_idx:03d} | target_pos {chosen_target_pos}"
-        if prompt_text:
-            title = f"{title}\n{prompt_text}"
-        fig.suptitle(title, y=0.99)
-        ax.set_xlim(-0.35, total_width + 0.35)
-        ax.set_ylim(-0.75, max_y + 1.2)
-        fig.tight_layout()
-        fig.subplots_adjust(top=0.9)
+            prompt_text = _trim_plot_text(str(row.get("prompt") or ""))
+            title = f"{run.model_name} | {run.dataset_name} | prompt {chosen_prompt_idx:03d} | target_pos {chosen_target_pos}"
+            if prompt_text:
+                title = f"{title}\n{prompt_text}"
+            fig.suptitle(title, y=0.99)
+            ax.set_xlim(-0.35, total_width + 0.35)
+            ax.set_ylim(-0.6, 1.75)
+            fig.tight_layout()
+            fig.subplots_adjust(top=0.78)
 
-        path = out_dir / (
-            f"{run.run_label}__prompt_{chosen_prompt_idx:03d}"
-            f"__all_attributions_all_dimreds__target_{chosen_target_pos}__importance_score.png"
-        )
-        save_figure(fig, path)
-        saved_paths.append(path)
+            path = prompt_dir / f"{attr_tag}__{dimred_tag}__target_{chosen_target_pos}__importance_score.png"
+            save_figure(fig, path)
+            saved_paths.append(path)
 
     return saved_paths
 
@@ -1737,6 +2137,8 @@ def create_all_plots(
     skip_bar_plot: bool = False,
     skip_stat_plot: bool = False,
     skip_heatmap_plot: bool = False,
+    skip_importance_spread_plot: bool = False,
+    skip_soft_comp_correlation_plot: bool = False,
     skip_component_plot: bool = False,
     skip_token_plot: bool = False,
     token_attribution: str | None = None,
@@ -1807,6 +2209,7 @@ def create_all_plots(
         filtered_records = run.records[run.records["prompt_idx"].isin(selected_prompt_indices)].copy()
         summary_df = summarize_records(filtered_records)
         stats_df = compute_baseline_comparison_stats(filtered_records, alpha=stat_alpha)
+        distribution_df = summarize_importance_distribution(filtered_records)
         if summary_df.empty:
             print(f"[skip] {run.run_label}: no successful records after prompt filtering")
             report["skipped"].append({"run_dir": str(run_dir), "reason": "no_successful_records_after_prompt_filtering"})
@@ -1821,6 +2224,11 @@ def create_all_plots(
         summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__summary.csv", index=False)
         if not stats_df.empty:
             stats_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__baseline_stats.csv", index=False)
+        if not distribution_df.empty:
+            distribution_df.to_csv(
+                run_plot_dir / f"{run.run_label}__{selection_label}__importance_distribution_summary.csv",
+                index=False,
+            )
         if not plot_summary_df.empty:
             plot_summary_df.to_csv(run_plot_dir / f"{run.run_label}__{selection_label}__best_n_components_summary.csv", index=False)
         if not plot_stats_df.empty:
@@ -1832,6 +2240,8 @@ def create_all_plots(
             "stats": [],
             "heatmaps": [],
             "heatmaps_all_dimreds": [],
+            "importance_spread": [],
+            "soft_comp_correlation": [],
             "components": [],
             "tokens": [],
             "special_attribution": [],
@@ -1906,6 +2316,32 @@ def create_all_plots(
                     generated_paths["heatmaps_all_dimreds"].append(str(full_heatmap_path))
             except Exception as exc:
                 print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
+
+        if not skip_importance_spread_plot:
+            try:
+                paths = plot_importance_distribution_heatmaps(
+                    run=run,
+                    distribution_df=distribution_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                )
+                generated_paths["importance_spread"].extend(str(path) for path in paths)
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: importance spread plot failed: {exc}")
+
+        if not skip_soft_comp_correlation_plot:
+            try:
+                path = plot_top1_share_soft_comp_correlation(
+                    run=run,
+                    distribution_df=distribution_df,
+                    summary_df=summary_df,
+                    selected_prompt_indices=selected_prompt_indices,
+                    out_dir=run_plot_dir,
+                )
+                if path is not None:
+                    generated_paths["soft_comp_correlation"].append(str(path))
+            except Exception as exc:
+                print(f"[warn] {run.run_label}: soft comp correlation plot failed: {exc}")
 
         if not skip_component_plot:
             try:
@@ -2001,6 +2437,8 @@ def main() -> None:
     parser.add_argument("--skip-bar-plot", action="store_true")
     parser.add_argument("--skip-stat-plot", action="store_true")
     parser.add_argument("--skip-heatmap-plot", action="store_true")
+    parser.add_argument("--skip-importance-spread-plot", action="store_true")
+    parser.add_argument("--skip-soft-comp-correlation-plot", action="store_true")
     parser.add_argument("--skip-component-plot", action="store_true")
     parser.add_argument("--skip-token-plot", action="store_true")
     parser.add_argument("--stat-alpha", type=float, default=0.05)
@@ -2056,6 +2494,8 @@ def main() -> None:
         skip_bar_plot=args.skip_bar_plot,
         skip_stat_plot=args.skip_stat_plot,
         skip_heatmap_plot=args.skip_heatmap_plot,
+        skip_importance_spread_plot=args.skip_importance_spread_plot,
+        skip_soft_comp_correlation_plot=args.skip_soft_comp_correlation_plot,
         skip_component_plot=args.skip_component_plot,
         skip_token_plot=args.skip_token_plot,
         token_attribution=args.token_attribution,

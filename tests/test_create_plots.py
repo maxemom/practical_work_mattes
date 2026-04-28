@@ -31,11 +31,14 @@ from scripts.create_plots import (
     plot_baseline_bars,
     plot_baseline_stat_heatmaps,
     plot_dimred_bars_per_attribution,
+    plot_importance_distribution_heatmaps,
     plot_metric_heatmaps,
     plot_metric_heatmaps_all_dimreds,
     plot_n_components_comparison,
+    plot_top1_share_soft_comp_correlation,
     plot_token_attribution_rows,
     set_paper_plot_style,
+    summarize_importance_distribution,
     summarize_records,
 )
 
@@ -451,6 +454,27 @@ def test_compute_baseline_comparison_stats_pairs_against_l2_baseline(tmp_path: P
     assert baseline_row["soft_comp_delta_mean"] == pytest.approx(0.0)
 
 
+def test_summarize_importance_distribution_captures_spread_across_k(tmp_path: Path) -> None:
+    run_dir = _build_run_dir(tmp_path)
+    run = load_run_records(run_dir)
+
+    distribution = summarize_importance_distribution(run.records)
+
+    saliency_baseline = distribution[
+        (distribution["attribution_tag"] == "saliency")
+        & (distribution["dimred_tag"] == "baseline")
+    ].iloc[0]
+    saliency_pca_3 = distribution[
+        (distribution["attribution_tag"] == "saliency")
+        & (distribution["dimred_tag"] == "pca_n_components_3")
+    ].iloc[0]
+
+    assert saliency_baseline["distribution_sample_count"] == 4
+    assert saliency_baseline["top3_share_mean"] == pytest.approx(1.0)
+    assert saliency_pca_3["top1_share_mean"] < saliency_baseline["top1_share_mean"]
+    assert saliency_pca_3["normalized_entropy_mean"] > saliency_baseline["normalized_entropy_mean"]
+
+
 def test_create_all_plots_respects_grid_model_dataset_selection(tmp_path: Path) -> None:
     set_paper_plot_style()
     _build_run_dir(
@@ -507,6 +531,9 @@ def test_create_plots_writes_all_plot_types(tmp_path: Path) -> None:
     stat_path = plot_baseline_stat_heatmaps(run, stats, selected_prompt_indices, plot_dir)
     heatmap_path = plot_metric_heatmaps(run, summary, selected_prompt_indices, plot_dir)
     full_heatmap_path = plot_metric_heatmaps_all_dimreds(run, summary, selected_prompt_indices, plot_dir)
+    distribution = summarize_importance_distribution(run.records[run.records["prompt_idx"].isin(selected_prompt_indices)])
+    importance_distribution_paths = plot_importance_distribution_heatmaps(run, distribution, selected_prompt_indices, plot_dir)
+    correlation_path = plot_top1_share_soft_comp_correlation(run, distribution, summary, selected_prompt_indices, plot_dir)
     component_path = plot_n_components_comparison(run, run.records, selected_prompt_indices, plot_dir)
     dimred_bar_paths = plot_dimred_bars_per_attribution(run, summary, selected_prompt_indices, plot_dir)
     token_path = plot_token_attribution_rows(
@@ -523,6 +550,9 @@ def test_create_plots_writes_all_plot_types(tmp_path: Path) -> None:
     assert stat_path is not None and stat_path.exists()
     assert heatmap_path is not None and heatmap_path.exists()
     assert full_heatmap_path is not None and full_heatmap_path.exists()
+    assert len(importance_distribution_paths) == 3
+    assert all(path.exists() for path in importance_distribution_paths)
+    assert correlation_path is not None and correlation_path.exists()
     assert component_path is not None and component_path.exists()
     assert len(dimred_bar_paths) == 2
     assert all(path.exists() for path in dimred_bar_paths)
@@ -559,11 +589,15 @@ def test_create_all_plots_writes_special_attribution_plots_only_for_special_data
     regular_entry = runs["demo-model__demo-dataset"]
 
     special_paths = [Path(path) for path in special_entry["generated_paths"]["special_attribution"]]
-    assert len(special_paths) == 2
+    assert len(special_paths) == 9
     assert all(path.exists() for path in special_paths)
     assert all("Special Attribution" in str(path) for path in special_paths)
     assert all("__target_2__" in path.name for path in special_paths)
+    assert {path.parent.name for path in special_paths} == {"prompt_000", "prompt_001"}
+    assert any(path.name.startswith("saliency__baseline__") for path in special_paths)
     assert len(special_entry["generated_paths"]["dimred_bars_per_attribution"]) == 2
     assert len(special_entry["generated_paths"]["heatmaps_all_dimreds"]) == 1
+    assert len(special_entry["generated_paths"]["importance_spread"]) == 3
+    assert len(special_entry["generated_paths"]["soft_comp_correlation"]) == 1
 
     assert regular_entry["generated_paths"]["special_attribution"] == []
