@@ -7,6 +7,10 @@ models:
 datasets:
   - name: visual
     path: data/processed/Sentences_for_attribution_plots.txt
+  - name: tellmewhy
+    path: data/processed/tellmewhy_100_seed42.txt
+  - name: wikitext2
+    path: data/processed/wikitext2_100_seed42.txt
 
 attribution_functions:
   - name: saliency
