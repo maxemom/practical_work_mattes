@@ -1,0 +1,62 @@
+{
+  "prompt_idx": 5,
+  "prompt": "Germany’s first female chancellor, Angela",
+  "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dataset_name": "visual",
+  "generated_text": "Germany’s first female chancellor, Angela Merkel, has been appointed as the new head of",
+  "source_ids": [
+    50170,
+    748,
+    1156,
+    8778,
+    76175,
+    11,
+    37143
+  ],
+  "total_ids": [
+    50170,
+    748,
+    1156,
+    8778,
+    76175,
+    11,
+    37143,
+    46420,
+    11,
+    702,
+    1012,
+    20822,
+    438,
+    279,
+    501,
+    1968,
+    315
+  ],
+  "generated_token_ids": [
+    46420,
+    11,
+    702,
+    1012,
+    20822,
+    438,
+    279,
+    501,
+    1968,
+    315
+  ],
+  "generated_tokens": [
+    " Merkel",
+    ",",
+    " has",
+    " been",
+    " appointed",
+    " as",
+    " the",
+    " new",
+    " head",
+    " of"
+  ],
+  "source_len": 7,
+  "total_len": 17,
+  "warnings": []
+}

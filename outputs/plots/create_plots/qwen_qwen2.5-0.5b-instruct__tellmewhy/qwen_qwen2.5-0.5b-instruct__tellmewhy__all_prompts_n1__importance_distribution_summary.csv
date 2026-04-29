@@ -1,0 +1,2 @@
+attribution_tag,attribution_name,dimred_tag,dimred_name,distribution_sample_count,token_count_mean,token_count_std,top1_share_mean,top1_share_std,top3_share_mean,top3_share_std,normalized_entropy_mean,normalized_entropy_std,coverage80_tokens_mean,coverage80_tokens_std,coverage80_ratio_mean,coverage80_ratio_std
+saliency,saliency,baseline,baseline,10,66.5,3.0276503540974917,0.12254562932370287,0.06055276481140449,0.25077407936188073,0.07017395458895134,0.8879377397590208,0.0430078035616065,31.3,2.6687491868330793,0.47152004834490346,0.04444902975167901

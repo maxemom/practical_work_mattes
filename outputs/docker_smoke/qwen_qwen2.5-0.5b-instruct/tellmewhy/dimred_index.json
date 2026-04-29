@@ -1,0 +1,9 @@
+{
+  "baseline": {
+    "name": "baseline",
+    "params": {
+      "norm": "l2"
+    },
+    "index": 0
+  }
+}

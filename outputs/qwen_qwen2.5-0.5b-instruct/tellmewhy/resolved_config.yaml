@@ -1,0 +1,166 @@
+paths:
+  raw:
+    wikitext2_train: data/raw/wikitext-2/train.txt
+    tellmewhy_csv: data/raw/tellmewhy/train.csv
+  processed:
+    wikitext2_100: data/processed/wikitext2_100_seed42.txt
+    tellmewhy_100: data/processed/tellmewhy_100_seed42.txt
+  output_dir: outputs
+seeds:
+  seed: 42
+runtime:
+  device: mps
+  dtype: auto
+generation:
+  max_new_tokens: 10
+  do_sample: false
+  temperature: 1.0
+  top_p: 1.0
+metrics:
+  mode: log_ratio
+  eps: 1.0e-12
+  random_baseline: softmax_uniform
+  normalize_columns: true
+  debug_steps: false
+dataset_preparation:
+  seed: 42
+  n_samples: 5
+  wikitext:
+    min_chars: 40
+    max_sentence_chars: 280
+    drop_section_titles: true
+  tellmewhy:
+    narrative_col: narrative
+    question_col: question
+    min_chars: 40
+    max_chars: 800
+environment:
+  required_modules:
+  - torch
+  - transformers
+  - inseq
+  - sklearn
+  - scipy
+  - matplotlib
+  - pandas
+  - yaml
+docker:
+  expected_files:
+  - docker/Dockerfile
+  - docker/docker-compose.yml
+model:
+  name: Qwen/Qwen2.5-0.5B-Instruct
+  params:
+    max_new_tokens: 10
+    do_sample: false
+dataset:
+  name: tellmewhy
+  path: data/processed/tellmewhy_100_seed42.txt
+attribution_functions:
+- tag: saliency
+  name: saliency
+  params: {}
+  index: 0
+- tag: input_x_gradient
+  name: input_x_gradient
+  params: {}
+  index: 1
+- tag: deeplift
+  name: deeplift
+  params: {}
+  index: 2
+- tag: gradient_shap
+  name: gradient_shap
+  params:
+    n_samples: 8
+    stdevs: 0.01
+  index: 3
+- tag: value_zeroing
+  name: value_zeroing
+  params: {}
+  index: 4
+- tag: lxt
+  name: lxt
+  params: {}
+  index: 5
+dimensionality_reduction_methods:
+- tag: baseline
+  name: baseline
+  params:
+    norm: l2
+  index: 0
+- tag: pca_n_components_1
+  name: pca
+  params:
+    n_components: 1
+  index: 1
+- tag: pca_n_components_3
+  name: pca
+  params:
+    n_components: 3
+  index: 2
+- tag: pca_n_components_5
+  name: pca
+  params:
+    n_components: 5
+  index: 3
+- tag: factor_analysis_n_components_1
+  name: factor_analysis
+  params:
+    n_components: 1
+  index: 4
+- tag: factor_analysis_n_components_3
+  name: factor_analysis
+  params:
+    n_components: 3
+  index: 5
+- tag: factor_analysis_n_components_5
+  name: factor_analysis
+  params:
+    n_components: 5
+  index: 6
+- tag: ica_n_components_1
+  name: ica
+  params:
+    n_components: 1
+  index: 7
+- tag: ica_n_components_3
+  name: ica
+  params:
+    n_components: 3
+  index: 8
+- tag: ica_n_components_5
+  name: ica
+  params:
+    n_components: 5
+  index: 9
+- tag: kernel_pca_n_components_1
+  name: kernel_pca
+  params:
+    n_components: 1
+  index: 10
+- tag: kernel_pca_n_components_3
+  name: kernel_pca
+  params:
+    n_components: 3
+  index: 11
+- tag: kernel_pca_n_components_5
+  name: kernel_pca
+  params:
+    n_components: 5
+  index: 12
+- tag: nmf_n_components_1
+  name: nmf
+  params:
+    n_components: 1
+  index: 13
+- tag: nmf_n_components_3
+  name: nmf
+  params:
+    n_components: 3
+  index: 14
+- tag: nmf_n_components_5
+  name: nmf
+  params:
+    n_components: 5
+  index: 15

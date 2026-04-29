@@ -1,0 +1,2 @@
+attribution_tag,attribution_name,dimred_tag,dimred_name,prompt_count,soft_suff_mean,soft_suff_std,soft_comp_mean,soft_comp_std,final_suff_mean,final_suff_std,final_comp_mean,final_comp_std
+saliency,saliency,baseline,baseline,1,0.010989253737974257,0.0,0.11925413128731233,0.0,7.04835058454808,0.0,0.8105209751891106,0.0

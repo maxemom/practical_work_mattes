@@ -1,0 +1,35 @@
+{
+  "saliency": {
+    "name": "saliency",
+    "params": {},
+    "index": 0
+  },
+  "input_x_gradient": {
+    "name": "input_x_gradient",
+    "params": {},
+    "index": 1
+  },
+  "deeplift": {
+    "name": "deeplift",
+    "params": {},
+    "index": 2
+  },
+  "gradient_shap": {
+    "name": "gradient_shap",
+    "params": {
+      "n_samples": 8,
+      "stdevs": 0.01
+    },
+    "index": 3
+  },
+  "value_zeroing": {
+    "name": "value_zeroing",
+    "params": {},
+    "index": 4
+  },
+  "lxt": {
+    "name": "lxt",
+    "params": {},
+    "index": 5
+  }
+}

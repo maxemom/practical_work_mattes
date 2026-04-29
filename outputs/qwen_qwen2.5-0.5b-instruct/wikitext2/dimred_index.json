@@ -1,0 +1,114 @@
+{
+  "baseline": {
+    "name": "baseline",
+    "params": {
+      "norm": "l2"
+    },
+    "index": 0
+  },
+  "pca_n_components_1": {
+    "name": "pca",
+    "params": {
+      "n_components": 1
+    },
+    "index": 1
+  },
+  "pca_n_components_3": {
+    "name": "pca",
+    "params": {
+      "n_components": 3
+    },
+    "index": 2
+  },
+  "pca_n_components_5": {
+    "name": "pca",
+    "params": {
+      "n_components": 5
+    },
+    "index": 3
+  },
+  "factor_analysis_n_components_1": {
+    "name": "factor_analysis",
+    "params": {
+      "n_components": 1
+    },
+    "index": 4
+  },
+  "factor_analysis_n_components_3": {
+    "name": "factor_analysis",
+    "params": {
+      "n_components": 3
+    },
+    "index": 5
+  },
+  "factor_analysis_n_components_5": {
+    "name": "factor_analysis",
+    "params": {
+      "n_components": 5
+    },
+    "index": 6
+  },
+  "ica_n_components_1": {
+    "name": "ica",
+    "params": {
+      "n_components": 1
+    },
+    "index": 7
+  },
+  "ica_n_components_3": {
+    "name": "ica",
+    "params": {
+      "n_components": 3
+    },
+    "index": 8
+  },
+  "ica_n_components_5": {
+    "name": "ica",
+    "params": {
+      "n_components": 5
+    },
+    "index": 9
+  },
+  "kernel_pca_n_components_1": {
+    "name": "kernel_pca",
+    "params": {
+      "n_components": 1
+    },
+    "index": 10
+  },
+  "kernel_pca_n_components_3": {
+    "name": "kernel_pca",
+    "params": {
+      "n_components": 3
+    },
+    "index": 11
+  },
+  "kernel_pca_n_components_5": {
+    "name": "kernel_pca",
+    "params": {
+      "n_components": 5
+    },
+    "index": 12
+  },
+  "nmf_n_components_1": {
+    "name": "nmf",
+    "params": {
+      "n_components": 1
+    },
+    "index": 13
+  },
+  "nmf_n_components_3": {
+    "name": "nmf",
+    "params": {
+      "n_components": 3
+    },
+    "index": 14
+  },
+  "nmf_n_components_5": {
+    "name": "nmf",
+    "params": {
+      "n_components": 5
+    },
+    "index": 15
+  }
+}

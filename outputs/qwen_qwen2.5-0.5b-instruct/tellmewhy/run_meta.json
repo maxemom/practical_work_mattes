@@ -1,0 +1,13 @@
+{
+  "timestamp_utc": "2026-04-12T01:46:37.495667+00:00",
+  "python": "3.11.14",
+  "torch": "2.11.0",
+  "transformers": "5.5.0",
+  "inseq": "0.7.1",
+  "scipy": "1.17.1",
+  "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dataset_name": "tellmewhy",
+  "requested_device": "auto",
+  "device": "mps",
+  "model_dtype": "float32"
+}
