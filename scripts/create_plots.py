@@ -15,6 +15,7 @@ matplotlib.use("Agg")
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
@@ -748,14 +749,14 @@ def plot_baseline_bars(
     selected_prompt_indices: Sequence[int],
     out_dir: Path,
     dimred_query: str = "baseline",
-) -> Path | None:
+) -> list[Path]:
     if summary_df.empty:
-        return None
+        return []
 
     dimred_tag = _resolve_dimred_tag(run, dimred_query)
     subset = summary_df[summary_df["dimred_tag"] == dimred_tag].copy()
     if subset.empty:
-        return None
+        return []
 
     ordered_tags = _ordered_attr_tags(run, subset)
     subset["attr_order"] = subset["attribution_tag"].map({tag: idx for idx, tag in enumerate(ordered_tags)})
@@ -769,11 +770,20 @@ def plot_baseline_bars(
     colors = plt.cm.tab10(np.linspace(0.0, 0.9, len(methods)))
     x = np.arange(len(methods))
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(8.5, len(methods) * 1.15), 4.1))
-    for ax, values, errors, ylabel, show_zero in (
-        (axes[0], suff_values, suff_errors, "Soft Suff", True),
-        (axes[1], comp_values, comp_errors, "Soft Comp", False),
-    ):
+    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    dimred_name = subset["dimred_name"].iloc[0]
+    configs = [
+        (suff_values, suff_errors, "Soft Sufficiency", True, "soft_sufficiency"),
+        (comp_values, comp_errors, "Soft Comprehensiveness", False, "soft_comprehensiveness"),
+    ]
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(max(10.5, len(methods) * 1.65), 4.9),
+        sharex=True,
+    )
+    for ax, (values, errors, ylabel, show_zero, _) in zip(axes, configs):
         ax.bar(x, values, yerr=errors, capsize=4, color=colors, edgecolor="#1F2933", linewidth=0.8)
         ax.set_xticks(x)
         ax.set_xticklabels(methods, rotation=45, ha="right")
@@ -783,19 +793,18 @@ def plot_baseline_bars(
         if show_zero:
             ax.axhline(0.0, color="black", linewidth=0.8)
         ax.set_ylim(*_dynamic_limits(values, include_zero=show_zero))
+        ax.set_title(ylabel)
 
-    selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
-    dimred_name = subset["dimred_name"].iloc[0]
     fig.suptitle(
-        f"{_pretty_name(dimred_name)} comparison | {run.model_name} | {run.dataset_name} | {selection_title}",
+        f"{_pretty_name(dimred_name)} baseline comparison | {run.model_name} | {run.dataset_name} | {selection_title}",
         y=0.98,
     )
     fig.tight_layout()
-    fig.subplots_adjust(top=0.82)
+    fig.subplots_adjust(top=0.84)
 
-    path = out_dir / f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}__{dimred_tag}__bars.png"
+    path = out_dir / f"{run.run_label}__{selection_label}__{dimred_tag}__bars__soft_sufficiency_and_comprehensiveness.png"
     save_figure(fig, path)
-    return path
+    return [path]
 
 
 def _significance_stars(p_value: float) -> str:
@@ -864,12 +873,14 @@ def plot_baseline_stat_heatmaps(
     out_dir: Path,
     *,
     alpha: float = 0.05,
-) -> Path | None:
+) -> list[Path]:
     if stats_df.empty:
-        return None
+        return []
+    if len(set(int(idx) for idx in selected_prompt_indices)) <= 1:
+        return []
     stats_df = filter_to_n_components_per_dimred(run, stats_df, n_components=1, include_baseline=True)
     if stats_df.empty:
-        return None
+        return []
 
     attr_tags = _available_attr_tags(run, stats_df)
     dimred_tags = _available_dimred_tags(run, stats_df)
@@ -911,17 +922,17 @@ def plot_baseline_stat_heatmaps(
     # Give each heatmap cell enough room for the three-line statistical label.
     cell_width = 1.6
     cell_height = 0.95
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=(
-            max(12.5, len(dimred_tags) * cell_width * 2.0),
-            max(5.8, len(attr_tags) * cell_height + 1.8),
-        ),
-    )
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    saved_paths: list[Path] = []
 
-    for ax, (prefix, title) in zip(axes, metric_configs):
+    for prefix, title in metric_configs:
+        fig, ax = plt.subplots(
+            figsize=(
+                max(7.4, len(dimred_tags) * cell_width + 1.6),
+                max(5.8, len(attr_tags) * cell_height + 1.8),
+            )
+        )
         mean_matrix = delta_matrices[prefix]
         p_matrix = pvalue_matrices[prefix]
         n_matrix = count_matrices[prefix]
@@ -969,19 +980,21 @@ def plot_baseline_stat_heatmaps(
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("Delta vs baseline")
 
-    fig.suptitle(
-        f"Paired sign test vs L2 baseline (baseline + k=1) | {run.model_name} | {run.dataset_name} | {selection_title} | alpha={alpha:.2f}",
-        y=0.98,
-    )
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.88)
+        fig.suptitle(
+            f"Paired sign test vs L2 baseline | {run.model_name} | {run.dataset_name} | {selection_title} | alpha={alpha:.2f}",
+            y=0.98,
+        )
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.88)
 
-    path = out_dir / (
-        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
-        "__baseline_stats_heatmaps.png"
-    )
-    save_figure(fig, path)
-    return path
+        metric_suffix = "soft_sufficiency" if prefix == "soft_suff" else "soft_comprehensiveness"
+        path = out_dir / (
+            f"{run.run_label}__{selection_label}"
+            f"__baseline_stats_heatmap__{metric_suffix}.png"
+        )
+        save_figure(fig, path)
+        saved_paths.append(path)
+    return saved_paths
 
 
 def _resolve_color_limits(matrix: np.ndarray, lower: float | None, upper: float | None) -> tuple[float, float]:
@@ -1015,12 +1028,12 @@ def plot_metric_heatmaps(
     suff_vmax: float | None = None,
     comp_vmin: float | None = None,
     comp_vmax: float | None = None,
-) -> Path | None:
+) -> list[Path]:
     if summary_df.empty:
-        return None
+        return []
     summary_df = filter_to_n_components_per_dimred(run, summary_df, n_components=1, include_baseline=True)
     if summary_df.empty:
-        return None
+        return []
 
     attr_tags = _available_attr_tags(run, summary_df)
     dimred_tags = _available_dimred_tags(run, summary_df)
@@ -1051,15 +1064,20 @@ def plot_metric_heatmaps(
         comp_mean[y, x] = float(row["soft_comp_mean"])
         comp_std[y, x] = float(row["soft_comp_std"])
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(9.8, len(dimred_tags) * 1.2), max(4.6, len(attr_tags) * 0.64)))
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
-
+    selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
     configs = [
-        (axes[0], suff_mean, suff_std, "Soft Suff", "Greens", suff_vmin, suff_vmax),
-        (axes[1], comp_mean, comp_std, "Soft Comp", "Reds", comp_vmin, comp_vmax),
+        (suff_mean, suff_std, "Soft Sufficiency", "Greens", suff_vmin, suff_vmax, "soft_sufficiency"),
+        (comp_mean, comp_std, "Soft Comprehensiveness", "Reds", comp_vmin, comp_vmax, "soft_comprehensiveness"),
     ]
 
-    for ax, mean_matrix, std_matrix, title, cmap_name, lower, upper in configs:
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(max(11.0, len(dimred_tags) * 2.0 + 2.4), max(4.9, len(attr_tags) * 0.72 + 1.7)),
+        sharey=True,
+    )
+    for ax, (mean_matrix, std_matrix, title, cmap_name, lower, upper, _) in zip(axes, configs):
         vmin, vmax = _resolve_color_limits(mean_matrix, lower, upper)
         im = ax.imshow(mean_matrix, aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
         ax.set_xticks(np.arange(len(dimred_tags)))
@@ -1094,11 +1112,11 @@ def plot_metric_heatmaps(
 
     fig.suptitle(f"{run.model_name} | {run.dataset_name} | {selection_title} | baseline + k=1 variants", y=0.98)
     fig.tight_layout()
-    fig.subplots_adjust(top=0.9)
+    fig.subplots_adjust(top=0.88)
 
-    path = out_dir / f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}__metric_heatmaps.png"
+    path = out_dir / f"{run.run_label}__{selection_label}__metric_heatmap__soft_sufficiency_and_comprehensiveness.png"
     save_figure(fig, path)
-    return path
+    return [path]
 
 
 def plot_dimred_bars_per_attribution(
@@ -1133,12 +1151,14 @@ def plot_dimred_bars_per_attribution(
         x = np.arange(subset.shape[0])
         colors = plt.cm.tab20(np.linspace(0.0, 0.95, max(1, subset.shape[0])))
 
-        fig, axes = plt.subplots(1, 2, figsize=(max(10.5, subset.shape[0] * 1.15), 4.4))
         metric_configs = [
-            (axes[0], suff_values, suff_errors, "Soft Sufficiency", True),
-            (axes[1], comp_values, comp_errors, "Soft Comprehensiveness", False),
+            (suff_values, suff_errors, "Soft Sufficiency", True, "soft_sufficiency"),
+            (comp_values, comp_errors, "Soft Comprehensiveness", False, "soft_comprehensiveness"),
         ]
-        for ax, values, errors, ylabel, show_zero in metric_configs:
+        attr_name = _pretty_name(str(subset["attribution_name"].iloc[0]))
+        selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
+        for values, errors, ylabel, show_zero, metric_suffix in metric_configs:
+            fig, ax = plt.subplots(figsize=(max(7.2, subset.shape[0] * 0.92), 4.9))
             ax.bar(x, values, yerr=errors, capsize=4, color=colors, edgecolor="#1F2933", linewidth=0.8)
             ax.set_xticks(x)
             ax.set_xticklabels(dimred_labels, rotation=45, ha="right")
@@ -1149,20 +1169,19 @@ def plot_dimred_bars_per_attribution(
                 ax.axhline(0.0, color="black", linewidth=0.8)
             ax.set_ylim(*_dynamic_limits(values, include_zero=show_zero))
 
-        attr_name = _pretty_name(str(subset["attribution_name"].iloc[0]))
-        fig.suptitle(
-            f"Dimensionality reduction comparison for {attr_name} | {run.model_name} | {run.dataset_name} | {selection_title}",
-            y=0.98,
-        )
-        fig.tight_layout()
-        fig.subplots_adjust(top=0.84)
+            fig.suptitle(
+                f"{ylabel} for {attr_name} | {run.model_name} | {run.dataset_name} | {selection_title}",
+                y=0.98,
+            )
+            fig.tight_layout()
+            fig.subplots_adjust(top=0.86)
 
-        path = out_dir / (
-            f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
-            f"__{attr_tag}__dimred_bars.png"
-        )
-        save_figure(fig, path)
-        saved_paths.append(path)
+            path = out_dir / (
+                f"{run.run_label}__{selection_label}"
+                f"__{attr_tag}__dimred_bars__{metric_suffix}.png"
+            )
+            save_figure(fig, path)
+            saved_paths.append(path)
 
     return saved_paths
 
@@ -1177,9 +1196,9 @@ def plot_metric_heatmaps_all_dimreds(
     suff_vmax: float | None = None,
     comp_vmin: float | None = None,
     comp_vmax: float | None = None,
-) -> Path | None:
+) -> list[Path]:
     if summary_df.empty:
-        return None
+        return []
 
     attr_tags = _ordered_attr_tags(run, summary_df)
     dimred_tags = _ordered_dimred_tags(run, summary_df)
@@ -1210,14 +1229,16 @@ def plot_metric_heatmaps_all_dimreds(
         comp_mean[y, x] = float(row["soft_comp_mean"])
         comp_std[y, x] = float(row["soft_comp_std"])
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(10.2, len(attr_tags) * 1.15), max(5.2, len(dimred_tags) * 0.64)))
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    saved_paths: list[Path] = []
     configs = [
-        (axes[0], suff_mean, suff_std, "Soft Sufficiency", "Greens", suff_vmin, suff_vmax),
-        (axes[1], comp_mean, comp_std, "Soft Comprehensiveness", "Reds", comp_vmin, comp_vmax),
+        (suff_mean, suff_std, "Soft Sufficiency", "Greens", suff_vmin, suff_vmax, "soft_sufficiency"),
+        (comp_mean, comp_std, "Soft Comprehensiveness", "Reds", comp_vmin, comp_vmax, "soft_comprehensiveness"),
     ]
 
-    for ax, mean_matrix, std_matrix, title, cmap_name, lower, upper in configs:
+    for mean_matrix, std_matrix, title, cmap_name, lower, upper, metric_suffix in configs:
+        fig, ax = plt.subplots(figsize=(max(7.2, len(attr_tags) * 1.08 + 1.5), max(5.4, len(dimred_tags) * 0.66 + 1.6)))
         vmin, vmax = _resolve_color_limits(mean_matrix, lower, upper)
         im = ax.imshow(mean_matrix, aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
         ax.set_xticks(np.arange(len(attr_tags)))
@@ -1250,19 +1271,20 @@ def plot_metric_heatmaps_all_dimreds(
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label(title)
 
-    fig.suptitle(
-        f"{run.model_name} | {run.dataset_name} | {selection_title} | all DimRed variants",
-        y=0.98,
-    )
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.89)
+        fig.suptitle(
+            f"{run.model_name} | {run.dataset_name} | {selection_title} | all DimRed variants",
+            y=0.98,
+        )
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.89)
 
-    path = out_dir / (
-        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
-        "__metric_heatmaps_all_dimreds.png"
-    )
-    save_figure(fig, path)
-    return path
+        path = out_dir / (
+            f"{run.run_label}__{selection_label}"
+            f"__metric_heatmap_all_dimreds__{metric_suffix}.png"
+        )
+        save_figure(fig, path)
+        saved_paths.append(path)
+    return saved_paths
 
 
 def _plot_single_importance_distribution_heatmap(
@@ -1295,35 +1317,56 @@ def _plot_single_importance_distribution_heatmap(
         dimred_name = matches["dimred_name"].iloc[0] if not matches.empty else run.dimred_index.get(tag, {}).get("name", tag)
         dimred_labels[tag] = _dimred_display_label(run, tag, str(dimred_name))
 
-    attr_to_y = {tag: idx for idx, tag in enumerate(attr_tags)}
-    dimred_to_x = {tag: idx for idx, tag in enumerate(dimred_tags)}
-    mean_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
-    std_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+    flip_axes = metric_prefix == "top1_share"
+    if flip_axes:
+        attr_to_x = {tag: idx for idx, tag in enumerate(attr_tags)}
+        dimred_to_y = {tag: idx for idx, tag in enumerate(dimred_tags)}
+        mean_matrix = np.full((len(dimred_tags), len(attr_tags)), np.nan, dtype=float)
+        std_matrix = np.full((len(dimred_tags), len(attr_tags)), np.nan, dtype=float)
+        for _, row in distribution_df.iterrows():
+            y = dimred_to_y[str(row["dimred_tag"])]
+            x = attr_to_x[str(row["attribution_tag"])]
+            mean_matrix[y, x] = float(row.get(f"{metric_prefix}_mean", float("nan")))
+            std_matrix[y, x] = float(row.get(f"{metric_prefix}_std", float("nan")))
+        x_labels = [attr_labels[tag] for tag in attr_tags]
+        y_labels = [dimred_labels[tag] for tag in dimred_tags]
+    else:
+        attr_to_y = {tag: idx for idx, tag in enumerate(attr_tags)}
+        dimred_to_x = {tag: idx for idx, tag in enumerate(dimred_tags)}
+        mean_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+        std_matrix = np.full((len(attr_tags), len(dimred_tags)), np.nan, dtype=float)
+        for _, row in distribution_df.iterrows():
+            y = attr_to_y[str(row["attribution_tag"])]
+            x = dimred_to_x[str(row["dimred_tag"])]
+            mean_matrix[y, x] = float(row.get(f"{metric_prefix}_mean", float("nan")))
+            std_matrix[y, x] = float(row.get(f"{metric_prefix}_std", float("nan")))
+        x_labels = [dimred_labels[tag] for tag in dimred_tags]
+        y_labels = [attr_labels[tag] for tag in attr_tags]
 
-    for _, row in distribution_df.iterrows():
-        y = attr_to_y[str(row["attribution_tag"])]
-        x = dimred_to_x[str(row["dimred_tag"])]
-        mean_matrix[y, x] = float(row.get(f"{metric_prefix}_mean", float("nan")))
-        std_matrix[y, x] = float(row.get(f"{metric_prefix}_std", float("nan")))
-
-    cell_width = 1.35
-    cell_height = 0.95
+    cell_width = 1.65 if flip_axes else 1.35
+    cell_height = 1.12 if flip_axes else 0.95
     fig, ax = plt.subplots(
         figsize=(
-            max(7.6, len(dimred_tags) * cell_width + 1.6),
-            max(5.2, len(attr_tags) * cell_height + 1.7),
+            max(7.6, mean_matrix.shape[1] * cell_width + 1.8),
+            max(5.4, mean_matrix.shape[0] * cell_height + 1.9),
         )
     )
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
     im = ax.imshow(mean_matrix, aspect="auto", cmap=cmap_name, vmin=vmin, vmax=vmax)
-    ax.set_xticks(np.arange(len(dimred_tags)))
-    ax.set_xticklabels([dimred_labels[tag] for tag in dimred_tags], rotation=45, ha="right")
-    ax.set_yticks(np.arange(len(attr_tags)))
-    ax.set_yticklabels([attr_labels[tag] for tag in attr_tags])
-    ax.set_title(title)
+    ax.set_xticks(np.arange(len(x_labels)))
+    if flip_axes:
+        ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=15.0)
+    else:
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(y_labels)))
+    if flip_axes:
+        ax.set_yticklabels(y_labels, fontsize=15.0)
+    else:
+        ax.set_yticklabels(y_labels)
+    ax.set_title(title, fontsize=17.0 if flip_axes else None)
 
-    ax.set_xticks(np.arange(-0.5, len(dimred_tags), 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, len(attr_tags), 1), minor=True)
+    ax.set_xticks(np.arange(-0.5, len(x_labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(y_labels), 1), minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=1)
     ax.tick_params(which="minor", bottom=False, left=False)
 
@@ -1339,16 +1382,20 @@ def _plot_single_importance_distribution_heatmap(
                 text,
                 ha="center",
                 va="center",
-                fontsize=8.0,
+                fontsize=14.0 if flip_axes else 8.0,
                 color=_heatmap_text_color(value, norm),
             )
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label(title)
+    if flip_axes:
+        cbar.ax.tick_params(labelsize=13.0)
+        cbar.ax.yaxis.label.set_size(14.0)
 
     fig.suptitle(
         f"Importance distribution across source tokens | {run.model_name} | {run.dataset_name} | {selection_title} | absolute importance mass",
         y=0.98,
+        fontsize=14.0 if flip_axes else None,
     )
     fig.tight_layout()
     fig.subplots_adjust(top=0.9)
@@ -1451,30 +1498,33 @@ def plot_top1_share_soft_comp_correlation(
         subset = plot_df[plot_df["attribution_tag"].astype(str) == attr_tag].copy()
         if subset.empty:
             continue
-        attr_name = _pretty_name(str(subset["attribution_name"].iloc[0]))
         color = color_map[attr_tag]
-        ax.errorbar(
-            subset["top1_share_mean"].to_numpy(dtype=float),
-            subset["soft_comp_mean"].to_numpy(dtype=float),
-            xerr=subset["top1_share_std"].to_numpy(dtype=float),
-            yerr=subset["soft_comp_std"].to_numpy(dtype=float),
-            fmt="o",
-            markersize=5.5,
-            capsize=3,
-            linewidth=1.0,
-            alpha=0.9,
-            color=color,
-            label=attr_name,
+        subset["is_k1_dimred"] = subset.apply(
+            lambda row: _dimred_n_components(run, str(row["dimred_tag"]), None) == 1,
+            axis=1,
         )
-        for _, row in subset.iterrows():
-            dimred_label = _dimred_display_label(run, str(row["dimred_tag"]), str(row["dimred_name"])).replace("\n", " ")
-            ax.text(
-                float(row["top1_share_mean"]) + 0.008,
-                float(row["soft_comp_mean"]) + 0.008,
-                dimred_label,
-                fontsize=7.5,
-                color=color,
+        regular = subset[~subset["is_k1_dimred"]]
+        k1 = subset[subset["is_k1_dimred"]]
+        if not regular.empty:
+            ax.scatter(
+                regular["top1_share_mean"].to_numpy(dtype=float),
+                regular["soft_comp_mean"].to_numpy(dtype=float),
+                s=38,
+                marker="o",
                 alpha=0.9,
+                color=color,
+                edgecolors="#1F2933",
+                linewidths=0.5,
+            )
+        if not k1.empty:
+            ax.scatter(
+                k1["top1_share_mean"].to_numpy(dtype=float),
+                k1["soft_comp_mean"].to_numpy(dtype=float),
+                s=56,
+                marker="x",
+                alpha=0.95,
+                color=color,
+                linewidths=1.6,
             )
 
     x_values = plot_df["top1_share_mean"].to_numpy(dtype=float)
@@ -1511,7 +1561,30 @@ def plot_top1_share_soft_comp_correlation(
     ax.set_xlabel("Top-1 Share (lower = more distributed)")
     ax.set_ylabel("Soft Comprehensiveness (higher = better)")
     ax.grid(alpha=0.2)
-    ax.legend(title="Attribution", loc="best", frameon=True)
+    attribution_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=color_map[tag],
+            markeredgecolor="#1F2933",
+            markeredgewidth=0.5,
+            markersize=6,
+            label=_pretty_name(str(plot_df[plot_df["attribution_tag"].astype(str) == tag]["attribution_name"].iloc[0])),
+        )
+        for tag in attr_present
+    ]
+    marker_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color="#4B5563", markersize=6, label="Other DimRed"),
+        Line2D([0], [0], marker="x", linestyle="", color="#4B5563", markersize=7, markeredgewidth=1.6, label="DimRed k=1"),
+    ]
+    ax.legend(
+        handles=[*attribution_handles, *marker_handles],
+        title="Attribution colors / DimRed marker",
+        loc="best",
+        frameon=True,
+    )
     ax.set_xlim(*_dynamic_limits(x_values, include_zero=False))
     ax.set_ylim(*_dynamic_limits(y_values, include_zero=False))
 
@@ -1632,13 +1705,13 @@ def plot_n_components_comparison(
     records: pd.DataFrame,
     selected_prompt_indices: Sequence[int],
     out_dir: Path,
-) -> Path | None:
+) -> list[Path]:
     if records.empty:
-        return None
+        return []
 
     usable = records[~records["skipped"]].copy()
     if usable.empty:
-        return None
+        return []
 
     usable["dimred_n_components"] = usable.apply(
         lambda row: _dimred_n_components(
@@ -1651,7 +1724,7 @@ def plot_n_components_comparison(
     usable = usable[usable["dimred_n_components"].notna()].copy()
     usable = usable[usable["dimred_name"].astype(str).map(safe_name) != "baseline"].copy()
     if usable.empty:
-        return None
+        return []
 
     usable["dimred_n_components"] = usable["dimred_n_components"].astype(int)
     component_summary = (
@@ -1667,7 +1740,7 @@ def plot_n_components_comparison(
         )
     )
     if component_summary.empty:
-        return None
+        return []
 
     dimred_names = [
         name
@@ -1680,14 +1753,20 @@ def plot_n_components_comparison(
     component_values = sorted(component_summary["dimred_n_components"].astype(int).drop_duplicates().tolist())
     colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(1, len(dimred_names))))
     selection_title = _prompt_selection_title(selected_prompt_indices, run.records["prompt_idx"].nunique())
+    selection_label = _prompt_selection_label(selected_prompt_indices, run.records["prompt_idx"].nunique())
 
-    fig, axes = plt.subplots(1, 2, figsize=(max(10.5, len(component_values) * 1.2 + len(dimred_names) * 0.7), 4.7))
     metric_configs = [
-        (axes[0], "soft_suff_mean", "soft_suff_std", "Soft Suff", True),
-        (axes[1], "soft_comp_mean", "soft_comp_std", "Soft Comp", False),
+        ("soft_suff_mean", "soft_suff_std", "Soft Sufficiency", True),
+        ("soft_comp_mean", "soft_comp_std", "Soft Comprehensiveness", False),
     ]
 
-    for ax, mean_col, std_col, ylabel, show_zero in metric_configs:
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(max(10.5, len(component_values) * 1.7 + len(dimred_names) * 0.85), 4.9),
+        sharex=True,
+    )
+    for ax, (mean_col, std_col, ylabel, show_zero) in zip(axes, metric_configs):
         all_values: list[float] = []
         for color, dimred_name in zip(colors, dimred_names):
             subset = component_summary[component_summary["dimred_name"].astype(str) == dimred_name].sort_values("dimred_n_components")
@@ -1716,7 +1795,7 @@ def plot_n_components_comparison(
         ax.set_ylim(*_dynamic_limits(all_values, include_zero=show_zero))
         ax.set_title(ylabel)
 
-    axes[1].legend(title="DimRed", loc="best", frameon=True)
+    axes[-1].legend(title="DimRed", loc="best", frameon=True)
     fig.suptitle(
         f"n_components comparison | {run.model_name} | {run.dataset_name} | {selection_title} | averaged over attribution methods",
         y=0.98,
@@ -1724,12 +1803,9 @@ def plot_n_components_comparison(
     fig.tight_layout()
     fig.subplots_adjust(top=0.84)
 
-    path = out_dir / (
-        f"{run.run_label}__{_prompt_selection_label(selected_prompt_indices, run.records['prompt_idx'].nunique())}"
-        "__n_components_comparison.png"
-    )
+    path = out_dir / f"{run.run_label}__{selection_label}__n_components_comparison.png"
     save_figure(fig, path)
-    return path
+    return [path]
 
 
 def _resolve_tokenizer(model_name: str, local_files_only: bool = False) -> Any | None:
@@ -1800,10 +1876,10 @@ def _token_layout(tokens: Sequence[str]) -> tuple[list[tuple[float, float]], flo
     cursor = 0.0
     for token in tokens:
         display_token = str(token) if str(token) else "<empty>"
-        width = max(1.15, len(display_token) * 0.24 + 0.8)
+        width = max(1.25, len(display_token) * 0.28 + 0.9)
         center = cursor + width / 2.0
         layout.append((center, width))
-        cursor += width + 0.32
+        cursor += width + 0.16
     return layout, cursor
 
 
@@ -1901,16 +1977,16 @@ def plot_token_attribution_rows(
                 edgecolor = "#D1D5DB"
 
             label = "" if not np.isfinite(score) else f"{float(score):.2f}"
-            ax.text(center_x, base_y + 0.16, label, ha="center", va="center", fontsize=8)
+            ax.text(center_x, base_y + 0.18, label, ha="center", va="center", fontsize=8.5)
             ax.text(
                 center_x,
-                base_y - 0.22,
+                base_y - 0.24,
                 str(token_text),
                 ha="center",
                 va="center",
-                fontsize=10,
+                fontsize=11.5,
                 bbox={
-                    "boxstyle": "square,pad=0.25",
+                    "boxstyle": "square,pad=0.32",
                     "facecolor": facecolor,
                     "edgecolor": edgecolor,
                     "linewidth": 0.8,
@@ -2049,16 +2125,16 @@ def plot_special_attribution_importance_scores(
                     edgecolor = "#D1D5DB"
 
                 label = "" if not np.isfinite(score) else f"{float(score):.2f}"
-                ax.text(center_x, base_y + 0.15, label, ha="center", va="center", fontsize=7.5)
+                ax.text(center_x, base_y + 0.17, label, ha="center", va="center", fontsize=8.2)
                 ax.text(
                     center_x,
-                    base_y - 0.21,
+                    base_y - 0.23,
                     str(token_text),
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=10.5,
                     bbox={
-                        "boxstyle": "square,pad=0.23",
+                        "boxstyle": "square,pad=0.3",
                         "facecolor": facecolor,
                         "edgecolor": edgecolor,
                         "linewidth": 0.8,
@@ -2208,7 +2284,13 @@ def create_all_plots(
 
         filtered_records = run.records[run.records["prompt_idx"].isin(selected_prompt_indices)].copy()
         summary_df = summarize_records(filtered_records)
-        stats_df = compute_baseline_comparison_stats(filtered_records, alpha=stat_alpha)
+        should_create_paired_stats = len(set(int(idx) for idx in selected_prompt_indices)) > 1
+        should_create_comparison_plots = len(set(int(idx) for idx in selected_prompt_indices)) > 1
+        stats_df = (
+            compute_baseline_comparison_stats(filtered_records, alpha=stat_alpha)
+            if should_create_paired_stats
+            else pd.DataFrame()
+        )
         distribution_df = summarize_importance_distribution(filtered_records)
         if summary_df.empty:
             print(f"[skip] {run.run_label}: no successful records after prompt filtering")
@@ -2216,7 +2298,11 @@ def create_all_plots(
             continue
         plot_records = filter_to_best_n_components_per_dimred(run, filtered_records)
         plot_summary_df = summarize_records(plot_records)
-        plot_stats_df = compute_baseline_comparison_stats(plot_records, alpha=stat_alpha)
+        plot_stats_df = (
+            compute_baseline_comparison_stats(plot_records, alpha=stat_alpha)
+            if should_create_paired_stats
+            else pd.DataFrame()
+        )
 
         run_plot_dir = resolved_plot_root / run.run_label
         run_plot_dir.mkdir(parents=True, exist_ok=True)
@@ -2247,21 +2333,20 @@ def create_all_plots(
             "special_attribution": [],
         }
 
-        if not skip_bar_plot:
+        if not skip_bar_plot and should_create_comparison_plots:
             try:
                 bar_dimred_queries = [bar_dimred]
                 if all_bar_dimreds:
                     bar_dimred_queries = _available_dimred_tags(run, plot_summary_df)
                 for dimred_query in bar_dimred_queries:
-                    path = plot_baseline_bars(
+                    paths = plot_baseline_bars(
                         run=run,
                         summary_df=plot_summary_df,
                         selected_prompt_indices=selected_prompt_indices,
                         out_dir=run_plot_dir,
                         dimred_query=dimred_query,
                     )
-                    if path is not None:
-                        generated_paths["bars"].append(str(path))
+                    generated_paths["bars"].extend(str(path) for path in paths)
 
                 dimred_bar_paths = plot_dimred_bars_per_attribution(
                     run=run,
@@ -2275,21 +2360,20 @@ def create_all_plots(
 
         if not skip_stat_plot:
             try:
-                path = plot_baseline_stat_heatmaps(
+                paths = plot_baseline_stat_heatmaps(
                     run=run,
                     stats_df=stats_df,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                     alpha=stat_alpha,
                 )
-                if path is not None:
-                    generated_paths["stats"].append(str(path))
+                generated_paths["stats"].extend(str(path) for path in paths)
             except Exception as exc:
                 print(f"[warn] {run.run_label}: baseline stats plot failed: {exc}")
 
-        if not skip_heatmap_plot:
+        if not skip_heatmap_plot and should_create_comparison_plots:
             try:
-                path = plot_metric_heatmaps(
+                paths = plot_metric_heatmaps(
                     run=run,
                     summary_df=summary_df,
                     selected_prompt_indices=selected_prompt_indices,
@@ -2299,10 +2383,9 @@ def create_all_plots(
                     comp_vmin=comp_vmin,
                     comp_vmax=comp_vmax,
                 )
-                if path is not None:
-                    generated_paths["heatmaps"].append(str(path))
+                generated_paths["heatmaps"].extend(str(path) for path in paths)
 
-                full_heatmap_path = plot_metric_heatmaps_all_dimreds(
+                full_heatmap_paths = plot_metric_heatmaps_all_dimreds(
                     run=run,
                     summary_df=summary_df,
                     selected_prompt_indices=selected_prompt_indices,
@@ -2312,12 +2395,11 @@ def create_all_plots(
                     comp_vmin=comp_vmin,
                     comp_vmax=comp_vmax,
                 )
-                if full_heatmap_path is not None:
-                    generated_paths["heatmaps_all_dimreds"].append(str(full_heatmap_path))
+                generated_paths["heatmaps_all_dimreds"].extend(str(path) for path in full_heatmap_paths)
             except Exception as exc:
                 print(f"[warn] {run.run_label}: heatmap plot failed: {exc}")
 
-        if not skip_importance_spread_plot:
+        if not skip_importance_spread_plot and should_create_comparison_plots:
             try:
                 paths = plot_importance_distribution_heatmaps(
                     run=run,
@@ -2329,7 +2411,7 @@ def create_all_plots(
             except Exception as exc:
                 print(f"[warn] {run.run_label}: importance spread plot failed: {exc}")
 
-        if not skip_soft_comp_correlation_plot:
+        if not skip_soft_comp_correlation_plot and should_create_comparison_plots:
             try:
                 path = plot_top1_share_soft_comp_correlation(
                     run=run,
@@ -2343,20 +2425,19 @@ def create_all_plots(
             except Exception as exc:
                 print(f"[warn] {run.run_label}: soft comp correlation plot failed: {exc}")
 
-        if not skip_component_plot:
+        if not skip_component_plot and should_create_comparison_plots:
             try:
-                path = plot_n_components_comparison(
+                paths = plot_n_components_comparison(
                     run=run,
                     records=filtered_records,
                     selected_prompt_indices=selected_prompt_indices,
                     out_dir=run_plot_dir,
                 )
-                if path is not None:
-                    generated_paths["components"].append(str(path))
+                generated_paths["components"].extend(str(path) for path in paths)
             except Exception as exc:
                 print(f"[warn] {run.run_label}: n_components plot failed: {exc}")
 
-        if not skip_token_plot:
+        if not skip_token_plot and should_create_comparison_plots:
             try:
                 token_attr_queries = [token_attribution]
                 if all_token_attributions:
